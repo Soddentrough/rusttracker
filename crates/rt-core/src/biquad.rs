@@ -294,7 +294,23 @@ impl Lr4Filter {
 
 #[cfg(test)]
 mod tests {
-    use super::Lr4Filter;
+    use super::{BiquadFilter, Lr4Filter};
+
+    fn measure_steady_rms_gain(filter: &mut BiquadFilter, sr: f32, freq_hz: f32) -> f64 {
+        let mut out_sq = 0.0f64;
+        let mut in_sq = 0.0f64;
+        let total_samples = 8192usize;
+        let settle_samples = 4096usize;
+        for n in 0..total_samples {
+            let x = (2.0 * std::f32::consts::PI * freq_hz * (n as f32 / sr)).sin();
+            let y = filter.process(x);
+            if n >= settle_samples {
+                out_sq += (y as f64) * (y as f64);
+                in_sq += (x as f64) * (x as f64);
+            }
+        }
+        (out_sq / in_sq).sqrt()
+    }
 
     #[test]
     fn test_lr4_crossover_flat_sum_and_rolloff() {
@@ -352,5 +368,84 @@ mod tests {
             db_250 < -46.0 && db_250 > -50.0,
             "LR4 2 octaves below fc must be ~-48 dB (got {db_250:.2} dB)"
         );
+    }
+
+    #[test]
+    fn test_peaking_eq_and_shelf_responses_and_zero_gain_identity() {
+        let sr = 48_000.0;
+        let boost_db = 6.0f32;
+        let cut_db = -6.0f32;
+        let boost_lin = 10.0f64.powf(boost_db as f64 / 20.0);
+        let cut_lin = 10.0f64.powf(cut_db as f64 / 20.0);
+
+        // Peaking EQ: +6 dB / -6 dB at center freq, ~0 dB far from center, 0 dB gain = exact identity
+        let mut peak_boost = BiquadFilter::peaking_eq(sr, 1_000.0, 1.4, boost_db);
+        let gain_at_fc = measure_steady_rms_gain(&mut peak_boost, sr, 1_000.0);
+        assert!(
+            (gain_at_fc - boost_lin).abs() < 0.05,
+            "Peaking +6dB at fc expected ~{boost_lin:.3}, got {gain_at_fc:.3}"
+        );
+        let mut peak_far = BiquadFilter::peaking_eq(sr, 1_000.0, 1.4, boost_db);
+        let gain_far = measure_steady_rms_gain(&mut peak_far, sr, 100.0);
+        assert!((gain_far - 1.0).abs() < 0.05);
+
+        let mut peak_cut = BiquadFilter::peaking_eq(sr, 1_000.0, 1.4, cut_db);
+        let gain_cut = measure_steady_rms_gain(&mut peak_cut, sr, 1_000.0);
+        assert!((gain_cut - cut_lin).abs() < 0.05);
+
+        let mut peak_flat = BiquadFilter::peaking_eq(sr, 1_000.0, 1.0, 0.0);
+        assert_eq!(peak_flat.process(0.75), 0.75);
+
+        // Low shelf: +6 dB at 60 Hz, ~0 dB at 8000 Hz, 0 dB = identity
+        let mut ls_low = BiquadFilter::low_shelf(sr, 250.0, 0.707, boost_db);
+        assert!((measure_steady_rms_gain(&mut ls_low, sr, 60.0) - boost_lin).abs() < 0.08);
+        let mut ls_high = BiquadFilter::low_shelf(sr, 250.0, 0.707, boost_db);
+        assert!((measure_steady_rms_gain(&mut ls_high, sr, 8_000.0) - 1.0).abs() < 0.05);
+        let mut ls_flat = BiquadFilter::low_shelf(sr, 250.0, 0.707, 0.0);
+        assert_eq!(ls_flat.process(-0.42), -0.42);
+
+        // High shelf: +6 dB at 10 kHz, ~0 dB at 80 Hz, 0 dB = identity
+        let mut hs_high = BiquadFilter::high_shelf(sr, 3_000.0, 0.707, boost_db);
+        assert!((measure_steady_rms_gain(&mut hs_high, sr, 10_000.0) - boost_lin).abs() < 0.12);
+        let mut hs_low = BiquadFilter::high_shelf(sr, 3_000.0, 0.707, boost_db);
+        assert!((measure_steady_rms_gain(&mut hs_low, sr, 80.0) - 1.0).abs() < 0.05);
+        let mut hs_flat = BiquadFilter::high_shelf(sr, 3_000.0, 0.707, 0.0);
+        assert_eq!(hs_flat.process(0.33), 0.33);
+    }
+
+    #[test]
+    fn test_update_coeffs_state_handling_clear_nan_recovery_and_clamping() {
+        // Non-identity update_coeffs preserves internal z1/z2 state
+        let lp1 = BiquadFilter::lowpass(48_000.0, 1_000.0, 0.707);
+        let lp2 = BiquadFilter::lowpass(48_000.0, 2_000.0, 0.707);
+        let mut preserved = lp1;
+        let _ = preserved.process(1.0);
+        preserved.update_coeffs(lp2);
+        assert!(preserved.z1.abs() > 0.0 || preserved.z2.abs() > 0.0);
+
+        // Identity update_coeffs clears z1/z2 state, and clear_state clears explicitly
+        preserved.update_coeffs(BiquadFilter::default());
+        assert_eq!(preserved.z1, 0.0);
+        assert_eq!(preserved.z2, 0.0);
+
+        let mut dirty = lp1;
+        let _ = dirty.process(1.0);
+        dirty.clear_state();
+        assert_eq!(dirty.z1, 0.0);
+        assert_eq!(dirty.z2, 0.0);
+
+        // NaN/Inf self-healing: resets state and recovers to finite outputs on subsequent samples
+        assert_eq!(dirty.process(f32::NAN), 0.0);
+        assert_eq!(dirty.process(f32::INFINITY), 0.0);
+        let recovered = dirty.process(0.5);
+        assert!(recovered.is_finite() && recovered > 0.0);
+
+        // Extreme sample_rate / freq_hz / q arguments are safely clamped to finite outputs
+        let mut clamped_lp = BiquadFilter::lowpass(0.0, 100_000.0, 0.0);
+        let mut clamped_hp = BiquadFilter::highpass(100.0, 0.0, -5.0);
+        let mut clamped_eq = BiquadFilter::peaking_eq(0.0, 50_000.0, 0.0, 6.0);
+        assert!(clamped_lp.process(0.5).is_finite());
+        assert!(clamped_hp.process(0.5).is_finite());
+        assert!(clamped_eq.process(0.5).is_finite());
     }
 }

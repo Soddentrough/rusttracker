@@ -1,13 +1,10 @@
-use rusttracker::{audio, lyrics, state};
+mod common;
 
-#[test]
-fn test_midi_loading_and_tempo_map() {
-    let test_file = "audio_tests/darude-sandstorm.mid";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", test_file);
-        return;
-    }
-    let mut source = audio::load_audio_source(test_file).expect("Failed to load MIDI");
+use rusttracker::{audio, lyrics, openmpt_ffi, state};
+
+fn verify_midi_loading_and_tempo_map(test_file: &str) {
+    let mut source = audio::load_audio_source(test_file)
+        .unwrap_or_else(|e| panic!("Failed to load MIDI {test_file}: {e:?}"));
     let duration = source.get_duration_seconds();
     assert!(
         duration > 10.0,
@@ -32,102 +29,101 @@ fn test_midi_loading_and_tempo_map() {
 }
 
 #[test]
-fn test_audio_transition_and_fallback() {
-    let mod_path = "audio_tests/ive_got_the_power.mod";
-    let mid_path = "audio_tests/darude-sandstorm.mid";
-    if !std::path::Path::new(mod_path).exists() || !std::path::Path::new(mid_path).exists() {
-        eprintln!("Skipping test: audio_tests fixtures do not exist");
-        return;
-    }
+fn test_midi_loading_and_tempo_map() {
+    let dir = common::TempTestDir::new("midi_tempo");
+    let synth_mid = dir.path().join("synthetic_tempo.mid");
+    std::fs::write(&synth_mid, common::build_minimal_midi_bytes()).expect("write synthetic MIDI");
+    verify_midi_loading_and_tempo_map(synth_mid.to_str().unwrap());
 
+    let test_file = "audio_tests/darude-sandstorm.mid";
+    if std::path::Path::new(test_file).exists() {
+        verify_midi_loading_and_tempo_map(test_file);
+    }
+}
+
+fn verify_audio_transition_and_fallback(mod_path: &str, mid_path: &str) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         "Test App".to_string(),
     )));
 
     let handle1 = audio::start_audio_thread(mod_path, false, shared_state.clone())
         .expect("Failed to start first audio thread (MOD)");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let mod_type = {
+    let mut mod_type = None;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let st = shared_state.lock().unwrap();
-        assert!(
-            st.duration_seconds > 0.0,
-            "MOD track should report > 0 duration, got {}",
-            st.duration_seconds
-        );
-        assert!(
-            st.num_channels > 0,
-            "MOD track should report > 0 channels, got {}",
-            st.num_channels
-        );
-        assert!(
-            st.current_sample_rate > 0.0,
-            "MOD track should report > 0 sample rate, got {}",
-            st.current_sample_rate
-        );
-        assert!(
-            !st.module_type.is_empty(),
-            "MOD track should report non-empty module_type"
-        );
-        st.module_type.clone()
-    };
+        if st.duration_seconds > 0.0 && st.num_channels > 0 && !st.module_type.is_empty() {
+            assert!(
+                st.current_sample_rate > 0.0,
+                "MOD track should report > 0 sample rate, got {}",
+                st.current_sample_rate
+            );
+            mod_type = Some(st.module_type.clone());
+            break;
+        }
+    }
+    let mod_type = mod_type.expect("MOD track should populate metadata in shared state");
     drop(handle1);
 
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let handle2 = audio::start_audio_thread(mid_path, false, shared_state.clone())
         .expect("Failed to start second audio track (MIDI)");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    {
+    let mut updated_mid = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let st = shared_state.lock().unwrap();
-        assert!(
-            st.duration_seconds > 0.0,
-            "MIDI track should report > 0 duration, got {}",
-            st.duration_seconds
-        );
-        assert!(
-            st.num_channels > 0,
-            "MIDI track should report > 0 channels, got {}",
-            st.num_channels
-        );
-        assert!(
-            st.current_sample_rate > 0.0,
-            "MIDI track should report > 0 sample rate, got {}",
-            st.current_sample_rate
-        );
-        assert_ne!(
-            st.module_type, mod_type,
-            "Transitioning from MOD ({}) to MIDI should update module_type",
-            mod_type
-        );
+        if st.module_type != mod_type && st.duration_seconds > 0.0 && st.num_channels > 0 {
+            assert!(
+                st.current_sample_rate > 0.0,
+                "MIDI track should report > 0 sample rate, got {}",
+                st.current_sample_rate
+            );
+            updated_mid = true;
+            break;
+        }
     }
+    assert!(
+        updated_mid,
+        "Transitioning from MOD ({mod_type}) to MIDI should update module_type and metadata"
+    );
     drop(handle2);
 }
 
 #[test]
-fn test_video_transition_and_fallback() {
+fn test_audio_transition_and_fallback() {
+    let dir = common::TempTestDir::new("audio_transition");
+    let synth_mod = dir.path().join("synthetic.mod");
+    let synth_mid = dir.path().join("synthetic.mid");
+    std::fs::write(&synth_mod, openmpt_ffi::build_minimal_protracker_mod())
+        .expect("write synthetic MOD");
+    std::fs::write(&synth_mid, common::build_minimal_midi_bytes()).expect("write synthetic MIDI");
+    verify_audio_transition_and_fallback(synth_mod.to_str().unwrap(), synth_mid.to_str().unwrap());
+
+    let mod_path = "audio_tests/ive_got_the_power.mod";
+    let mid_path = "audio_tests/darude-sandstorm.mid";
+    if std::path::Path::new(mod_path).exists() && std::path::Path::new(mid_path).exists() {
+        verify_audio_transition_and_fallback(mod_path, mid_path);
+    }
+}
+
+fn verify_video_transition_and_fallback(video_path: &str) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         "Test App".to_string(),
     )));
-    let video_path = "audio_tests/portrait_test_90.mp4";
-    if !std::path::Path::new(video_path).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", video_path);
-        return;
-    }
 
     let handle = audio::start_audio_thread(video_path, false, shared_state.clone())
         .expect("Failed to start video audio thread");
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let rx = {
+    let mut rx_opt = None;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let st = shared_state.lock().unwrap();
-        assert!(
-            st.has_video_stream,
-            "Expected has_video_stream to be true for {}",
-            video_path
-        );
-        st.video_frame_rx
-            .clone()
-            .expect("Expected video_frame_rx to be populated for video file")
-    };
+        if st.has_video_stream && st.video_frame_rx.is_some() {
+            rx_opt = st.video_frame_rx.clone();
+            break;
+        }
+    }
+    let rx = rx_opt.expect("Expected has_video_stream and video_frame_rx to be populated");
     let frame = rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("Expected at least one decoded VideoFrame from video decoder thread");
@@ -139,23 +135,22 @@ fn test_video_transition_and_fallback() {
 }
 
 #[test]
-fn test_synthwave_lyrics_visualization_with_audio() {
-    // 1. Verify Visualizer 23 definition
-    let vis_def = state::VISUALIZERS
-        .iter()
-        .find(|v| v.id == 23)
-        .expect("Visualizer ID 23 (3D Glass Water Lyrics) must exist");
-    assert_eq!(vis_def.name, "3D Glass Water Lyrics");
-    assert_eq!(vis_def.filename, "vis_lyrics.wgsl");
+fn test_video_transition_and_fallback() {
+    let dir = common::TempTestDir::new("video_transition");
+    let synth_mp4 = dir.path().join("synthetic_portrait_90.mp4");
+    common::encode_synthetic_aac_51_media(&synth_mp4, 2.5, Some(90))
+        .expect("encode synthetic portrait MP4");
+    verify_video_transition_and_fallback(synth_mp4.to_str().unwrap());
 
-    // 2. Test sidecar discovery and loading with repo-local fixture
-    let track_path = "audio_tests/arth_mb.mp3";
-    if !std::path::Path::new(track_path).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", track_path);
-        return;
+    let video_path = "audio_tests/portrait_test_90.mp4";
+    if std::path::Path::new(video_path).exists() {
+        verify_video_transition_and_fallback(video_path);
     }
+}
+
+fn verify_lyrics_sidecar(track_path: &str) {
     let lrc = lyrics::load_lyrics_for_file(track_path)
-        .expect("Expected sidecar lyrics audio_tests/arth_mb.lrc to load");
+        .unwrap_or_else(|| panic!("Expected sidecar lyrics for {track_path} to load"));
     assert!(!lrc.lines.is_empty(), "Parsed lyrics should have lines");
 
     let first_ts = lrc.lines[0].time_seconds;
@@ -186,8 +181,55 @@ fn test_synthwave_lyrics_visualization_with_audio() {
 }
 
 #[test]
+fn test_synthwave_lyrics_visualization_with_audio() {
+    // 1. Verify Visualizer 23 definition
+    let vis_def = state::VISUALIZERS
+        .iter()
+        .find(|v| v.id == 23)
+        .expect("Visualizer ID 23 (3D Glass Water Lyrics) must exist");
+    assert_eq!(vis_def.name, "3D Glass Water Lyrics");
+    assert_eq!(vis_def.filename, "vis_lyrics.wgsl");
+
+    // 2. Always verify sidecar discovery and loading on a synthetic fixture
+    let dir = common::TempTestDir::new("synthwave_lyrics");
+    let synth_wav = dir.path().join("synth_lyrics_track.wav");
+    let synth_lrc = dir.path().join("synth_lyrics_track.lrc");
+    std::fs::write(&synth_wav, common::build_wav_bytes(48_000, 2, 48_000))
+        .expect("write synthetic WAV");
+    std::fs::write(
+        &synth_lrc,
+        "[00:01.00]Synthetic opening line\n[00:03.00]Synthetic second line\n",
+    )
+    .expect("write synthetic LRC");
+    verify_lyrics_sidecar(synth_wav.to_str().unwrap());
+
+    // 3. Also verify repo-local fixture if present
+    let track_path = "audio_tests/arth_mb.mp3";
+    if std::path::Path::new(track_path).exists() {
+        verify_lyrics_sidecar(track_path);
+    }
+}
+
+#[test]
 fn test_all_audio_test_files() {
-    let mut files: Vec<String> = Vec::new();
+    let dir = common::TempTestDir::new("all_audio_formats");
+    let synth_wav = dir.path().join("synth_stereo.wav");
+    let synth_flac = dir.path().join("synth_51.flac");
+    let synth_mid = dir.path().join("synth_song.mid");
+    let synth_mod = dir.path().join("synth_tracker.mod");
+    std::fs::write(&synth_wav, common::build_wav_bytes(48_000, 2, 48_000 * 2))
+        .expect("write synthetic WAV");
+    common::encode_synthetic_flac(&synth_flac, 6, 48_000, 2.0).expect("encode synthetic 5.1 FLAC");
+    std::fs::write(&synth_mid, common::build_minimal_midi_bytes()).expect("write synthetic MIDI");
+    std::fs::write(&synth_mod, openmpt_ffi::build_minimal_protracker_mod())
+        .expect("write synthetic MOD");
+
+    let mut files: Vec<String> = vec![
+        synth_wav.to_string_lossy().into_owned(),
+        synth_flac.to_string_lossy().into_owned(),
+        synth_mid.to_string_lossy().into_owned(),
+        synth_mod.to_string_lossy().into_owned(),
+    ];
     for root_file in ["test_sine.wav", "test_multichannel_sweep.wav"] {
         if std::path::Path::new(root_file).exists() {
             files.push(root_file.to_string());
@@ -220,6 +262,10 @@ fn test_all_audio_test_files() {
         files.extend(dir_files);
     }
 
+    assert!(
+        !files.is_empty(),
+        "Expected at least synthetic audio test files"
+    );
     println!("Testing {} sample files...", files.len());
     let mut failures = Vec::new();
 
@@ -385,14 +431,7 @@ fn test_timeline_time_formatting() {
     assert_eq!(state::format_timeline_time(3600.0, false), "1:00:00");
 }
 
-#[test]
-fn test_video_scrubbing_end_to_end() {
-    let video_path = "audio_tests/AAC 5.1.mp4";
-    if !std::path::Path::new(video_path).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", video_path);
-        return;
-    }
-
+fn verify_video_scrubbing_end_to_end(video_path: &str) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         video_path.to_string(),
     )));
@@ -403,18 +442,25 @@ fn test_video_scrubbing_end_to_end() {
 
     let handle = audio::start_audio_thread(video_path, false, shared_state.clone())
         .expect("Failed to start video audio thread");
-    std::thread::sleep(std::time::Duration::from_millis(250));
 
-    let (rx, free_tx, dur) = {
+    let mut rx_info = None;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let st = shared_state.lock().unwrap();
-        assert!(st.has_video_stream);
-        (
-            st.video_frame_rx.clone().unwrap(),
-            st.free_video_frame_tx.clone().unwrap(),
-            st.duration_seconds,
-        )
-    };
-    assert!(dur > 5.0, "Expected video duration > 5s, got {}", dur);
+        if st.has_video_stream
+            && st.video_frame_rx.is_some()
+            && st.free_video_frame_tx.is_some()
+            && st.duration_seconds > 5.0
+        {
+            rx_info = Some((
+                st.video_frame_rx.clone().unwrap(),
+                st.free_video_frame_tx.clone().unwrap(),
+                st.duration_seconds,
+            ));
+            break;
+        }
+    }
+    let (rx, free_tx, dur) = rx_info.expect("Expected video stream metadata and >5s duration");
 
     while let Ok(f) = rx.try_recv() {
         let _ = free_tx.try_send(f);
@@ -453,4 +499,18 @@ fn test_video_scrubbing_end_to_end() {
     );
     drop(st);
     drop(handle);
+}
+
+#[test]
+fn test_video_scrubbing_end_to_end() {
+    let dir = common::TempTestDir::new("video_scrubbing");
+    let synth_mp4 = dir.path().join("synthetic_aac51.mp4");
+    common::encode_synthetic_aac_51_media(&synth_mp4, 7.0, Some(0))
+        .expect("encode synthetic AAC 5.1 MP4");
+    verify_video_scrubbing_end_to_end(synth_mp4.to_str().unwrap());
+
+    let video_path = "audio_tests/AAC 5.1.mp4";
+    if std::path::Path::new(video_path).exists() {
+        verify_video_scrubbing_end_to_end(video_path);
+    }
 }

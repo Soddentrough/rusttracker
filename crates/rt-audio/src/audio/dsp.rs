@@ -440,7 +440,7 @@ pub fn spawn_dsp_thread(
     sample_rate: u32,
     max_frequency: f32,
     window_size: usize,
-) {
+) -> std::thread::JoinHandle<()> {
     spawn_dsp_thread_with_recycle(
         rx,
         shared_state,
@@ -448,7 +448,7 @@ pub fn spawn_dsp_thread(
         max_frequency,
         window_size,
         None,
-    );
+    )
 }
 
 pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
@@ -458,7 +458,7 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
     max_frequency: f32,
     window_size: usize,
     recycle_tx_override: Option<Sender<DspMessage>>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut binned_data = vec![0.0; 1024];
         let mut gpu_spectrum = vec![0.0f32; 32 * 1024 * 2];
@@ -536,21 +536,22 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
             .unwrap_or(&dsp_recycle_channel().0);
 
         while let Ok(msg) = rx.recv() {
-            let (need_gpu_spectrum, stale_epoch) = if let Ok(mut state) = shared_state.lock() {
-                state.sync_rt_control();
-                if msg.seek_epoch < state.seek_epoch {
-                    (false, true)
+            let (need_gpu_spectrum, is_fullscreen_video, stale_epoch) =
+                if let Ok(mut state) = shared_state.lock() {
+                    state.sync_rt_control();
+                    if msg.seek_epoch < state.seek_epoch {
+                        (false, false, true)
+                    } else {
+                        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                        let is_fullscreen_video = state.video_mode == 3
+                            && (state.has_video_stream || state.video_frame_rx.is_some());
+                        let need_gpu =
+                            !is_fullscreen_video && (vis_def.id == 6 || vis_def.requires_resynth);
+                        (need_gpu, is_fullscreen_video, false)
+                    }
                 } else {
-                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                    let is_fullscreen_video = state.video_mode == 3
-                        && (state.has_video_stream || state.video_frame_rx.is_some());
-                    let need_gpu =
-                        !is_fullscreen_video && (vis_def.id == 6 || vis_def.requires_resynth);
-                    (need_gpu, false)
-                }
-            } else {
-                (false, false)
-            };
+                    (false, false, false)
+                };
 
             if stale_epoch {
                 let _ = recycle_tx.try_send(msg);
@@ -563,7 +564,7 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
                 .take_while(|ch| !ch.is_empty())
                 .count()
                 .min(32);
-            let fft_elapsed = if msg.audio_data.is_empty() {
+            let fft_elapsed = if is_fullscreen_video || msg.audio_data.is_empty() {
                 0.0
             } else {
                 let fft_start = Instant::now();
@@ -712,7 +713,7 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
                 }
 
                 let paused_loaded = state.is_paused && state.file_loaded;
-                if paused_loaded || msg.audio_data.is_empty() {
+                if paused_loaded || is_fullscreen_video || msg.audio_data.is_empty() {
                     state.stats.fft_us = 0.0;
                     if paused_loaded {
                         state.raw_spectrum_data.fill(0.0);
@@ -851,5 +852,5 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
             }
             let _ = recycle_tx.try_send(msg);
         }
-    });
+    })
 }

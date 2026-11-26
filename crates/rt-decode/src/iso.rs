@@ -1495,9 +1495,39 @@ pub mod test_helpers {
 mod tests {
     use super::test_helpers::{build_synthetic_dvd_iso, build_synthetic_vts_ifo};
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempTestDir(PathBuf);
+
+    impl TempTestDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rt_iso_test_{}_{}_{}",
+                tag,
+                std::process::id(),
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_parse_iso_and_vts_ifo_and_virtual_stream() {
+        let dir = TempTestDir::new("iso9660");
         let ifo_bytes = build_synthetic_vts_ifo();
         let mut vob1 = vec![0xAAu8; 4096]; // 2 sectors (sectors 0..=1)
         vob1[0..4].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
@@ -1513,7 +1543,7 @@ mod tests {
             ],
         );
 
-        let temp_iso = std::env::temp_dir().join("rusttracker_test_portishead_pnvc.iso");
+        let temp_iso = dir.path().join("portishead_pnvc.iso");
         std::fs::write(&temp_iso, &iso_bytes).expect("write synthetic ISO");
 
         let resolved = resolve_iso_or_vob_media(&temp_iso)
@@ -1545,7 +1575,207 @@ mod tests {
         assert_eq!(all_read.len(), 8192);
         assert_eq!(&all_read[0..4096], &vob1[..]);
         assert_eq!(&all_read[4096..8192], &vob2[..]);
+    }
 
-        let _ = std::fs::remove_file(&temp_iso);
+    #[test]
+    fn test_parse_dvd_bcd_time_fps_variants_and_short_input() {
+        assert_eq!(parse_dvd_bcd_time(&[]), 0.0);
+        assert_eq!(parse_dvd_bcd_time(&[0x01, 0x02, 0x03]), 0.0);
+        assert_eq!(parse_dvd_bcd_time(&[0x00, 0x00, 0x00, 0x40]), 0.0);
+
+        // 01:02:03 + 10 frames @ 25 fps (bits 7..6 = 1 -> 0x40 | 0x10 = 0x50)
+        let t_25 = parse_dvd_bcd_time(&[0x01, 0x02, 0x03, 0x50]);
+        assert!((t_25 - (3600.0 + 120.0 + 3.0 + 10.0 / 25.0)).abs() < 1e-6);
+
+        // 00:01:30 + 15 frames @ 29.97 fps (bits 7..6 = 3 -> 0xC0 | 0x15 = 0xD5)
+        let t_2997 = parse_dvd_bcd_time(&[0x00, 0x01, 0x30, 0xD5]);
+        assert!((t_2997 - (90.0 + 15.0 / 29.97)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_parse_vts_ifo_corrupt_multi_pgc_and_audio_codecs() {
+        assert!(parse_vts_ifo_bytes(&[0u8; 512]).is_none());
+        let mut wrong_magic = vec![0u8; 2048];
+        wrong_magic[..12].copy_from_slice(b"NOT_VTS_IFO!");
+        assert!(parse_vts_ifo_bytes(&wrong_magic).is_none());
+
+        // Start from synthetic IFO, expand to hold 2 PGCs and 4 audio codecs + commentary labels
+        let mut ifo = build_synthetic_vts_ifo();
+        ifo.resize(6144, 0);
+
+        // 4 audio streams at 0x0202
+        ifo[0x0202..0x0204].copy_from_slice(&4u16.to_be_bytes());
+        // Stream 0: AC3, "fr", Commentary=3
+        ifo[0x0204] = 1 << 2;
+        ifo[0x0205] = 0x05;
+        ifo[0x0206..0x0208].copy_from_slice(b"fr");
+        ifo[0x0209] = 3;
+        // Stream 1: MP2 (coding_mode=2), 2ch, Commentary=2
+        ifo[0x020C] = 2 << 5;
+        ifo[0x020D] = 0x01;
+        ifo[0x0211] = 2;
+        // Stream 2: LPCM (coding_mode=4), quant=2 (24-bit -> 0x80), rate=1 (96kHz -> 0x10), ch=5 (6ch)
+        ifo[0x0214] = 4 << 5;
+        ifo[0x0215] = 0x80 | 0x10 | 0x05;
+        ifo[0x0219] = 4;
+        // Stream 3: DTS (coding_mode=6), 6ch
+        ifo[0x021C] = 6 << 5;
+        ifo[0x021D] = 0x05;
+
+        // Rebuild VTS_PGCI at offset 2048 with 2 PGCs (PGC 0 shorter than PGC 1; PGC 1 has an angle-2 cell to skip)
+        let pgci = &mut ifo[2048..6144];
+        pgci.fill(0);
+        pgci[0..2].copy_from_slice(&2u16.to_be_bytes());
+        pgci[4..8].copy_from_slice(&2048u32.to_be_bytes());
+        pgci[8] = 0x81;
+        pgci[12..16].copy_from_slice(&32u32.to_be_bytes()); // PGC 0
+        pgci[16] = 0x82;
+        pgci[20..24].copy_from_slice(&512u32.to_be_bytes()); // PGC 1
+
+        // PGC 0: 00:00:10.00 (10s), 1 cell
+        pgci[32 + 3] = 1;
+        pgci[32 + 4..32 + 8].copy_from_slice(&[0x00, 0x00, 0x10, 0x40]);
+        pgci[32 + 0xE8..32 + 0xEA].copy_from_slice(&0x0100u16.to_be_bytes());
+        let p0c0 = 32 + 0x100;
+        pgci[p0c0 + 4..p0c0 + 8].copy_from_slice(&[0x00, 0x00, 0x10, 0x40]);
+        pgci[p0c0 + 20..p0c0 + 24].copy_from_slice(&0u32.to_be_bytes());
+
+        // PGC 1: 00:05:00.00 (300s), 2 raw cells (second cell is secondary angle -> skipped)
+        pgci[512 + 3] = 2;
+        pgci[512 + 4..512 + 8].copy_from_slice(&[0x00, 0x05, 0x00, 0x40]);
+        pgci[512 + 0xE8..512 + 0xEA].copy_from_slice(&0x0100u16.to_be_bytes());
+        let p1c0 = 512 + 0x100;
+        // Cell 0: Angle 1 (block_type=1 -> bits 5..4=1, block_mode=1 -> bits 7..6=1 => 0x50)
+        pgci[p1c0] = 0x50;
+        pgci[p1c0 + 4..p1c0 + 8].copy_from_slice(&[0x00, 0x05, 0x00, 0x40]);
+        pgci[p1c0 + 8..p1c0 + 12].copy_from_slice(&0u32.to_be_bytes());
+        pgci[p1c0 + 20..p1c0 + 24].copy_from_slice(&1u32.to_be_bytes());
+        // Cell 1: Angle 2 (block_type=1, block_mode=2 => 0x90) -> must be skipped
+        let p1c1 = p1c0 + 24;
+        pgci[p1c1] = 0x90;
+        pgci[p1c1 + 4..p1c1 + 8].copy_from_slice(&[0x00, 0x01, 0x00, 0x40]);
+        pgci[p1c1 + 8..p1c1 + 12].copy_from_slice(&2u32.to_be_bytes());
+        pgci[p1c1 + 20..p1c1 + 24].copy_from_slice(&3u32.to_be_bytes());
+
+        let parsed = parse_vts_ifo_bytes(&ifo).expect("parse multi-PGC VTS IFO");
+        assert_eq!(parsed.duration_sec, 300.0);
+        assert_eq!(parsed.cells.len(), 1);
+        assert_eq!(parsed.audio_streams.len(), 4);
+        assert_eq!(parsed.audio_streams[0].codec, "AC3");
+        assert_eq!(parsed.audio_streams[0].language.as_deref(), Some("fr"));
+        assert_eq!(
+            parsed.audio_streams[0].commentary_label.as_deref(),
+            Some("Director's Commentary")
+        );
+        assert_eq!(parsed.audio_streams[1].codec, "MP2");
+        assert_eq!(
+            parsed.audio_streams[1].commentary_label.as_deref(),
+            Some("Visually Impaired")
+        );
+        assert_eq!(parsed.audio_streams[2].codec, "LPCM");
+        assert_eq!(parsed.audio_streams[2].bit_depth, Some(24));
+        assert_eq!(parsed.audio_streams[2].sample_rate, 96_000);
+        assert_eq!(
+            parsed.audio_streams[2].commentary_label.as_deref(),
+            Some("Alternate Commentary")
+        );
+        assert_eq!(parsed.audio_streams[3].codec, "DTS");
+    }
+
+    #[test]
+    fn test_scan_udf_dvd_video_sectors_and_resolve_disk_vob_chain() {
+        let dir = TempTestDir::new("udf_and_vob_chain");
+
+        // 1. Raw UDF-like ISO image (no CD001 PVD):
+        // LBA 20..22: VTS_01_0.IFO (2 sectors)
+        // LBA 22..26: VOB payload (4 sectors = 8192 bytes)
+        // LBA 26..28: VTS_01_0.BUP (2 sectors, excluded from VOB range)
+        let ifo_bytes = build_synthetic_vts_ifo();
+        let mut raw_udf = vec![0u8; 28 * 2048];
+        raw_udf[20 * 2048..20 * 2048 + ifo_bytes.len()].copy_from_slice(&ifo_bytes);
+        raw_udf[22 * 2048..26 * 2048].fill(0x7C);
+        let udf_iso_path = dir.path().join("udf_only.iso");
+        std::fs::write(&udf_iso_path, &raw_udf).expect("write UDF ISO");
+
+        let udf_resolved = resolve_iso_or_vob_media(&udf_iso_path)
+            .expect("resolve UDF ISO")
+            .expect("UDF fallback must find DVDVIDEO-VTS sector");
+        assert_eq!(udf_resolved.media_kind, IsoMediaKind::DvdVideo);
+        assert_eq!(udf_resolved.total_bytes, 8192);
+        assert_eq!(udf_resolved.ifo_duration_sec, Some(5595.0));
+
+        // 2. Extracted VIDEO_TS folder on disk with VTS_01_0.IFO + VTS_01_1.VOB + VTS_01_2.VOB
+        let vts_dir = dir.path().join("VIDEO_TS");
+        std::fs::create_dir_all(&vts_dir).unwrap();
+        let ifo_path = vts_dir.join("VTS_01_0.IFO");
+        let vob1_path = vts_dir.join("VTS_01_1.VOB");
+        let vob2_path = vts_dir.join("VTS_01_2.VOB");
+        std::fs::write(&ifo_path, &ifo_bytes).unwrap();
+        std::fs::write(&vob1_path, vec![0x11u8; 4096]).unwrap();
+        std::fs::write(&vob2_path, vec![0x22u8; 4096]).unwrap();
+
+        let vob_resolved = resolve_iso_or_vob_media(&vob1_path)
+            .expect("resolve VOB chain")
+            .expect("Expected VOB chain resolution");
+        assert_eq!(vob_resolved.extents.len(), 2);
+        assert_eq!(vob_resolved.total_bytes, 8192);
+        assert_eq!(vob_resolved.ifo_duration_sec, Some(5595.0));
+        assert_eq!(vob_resolved.audio_streams.len(), 2);
+    }
+
+    #[test]
+    fn test_iso_virtual_stream_seek_bounds_and_cross_extent_reads() {
+        let dir = TempTestDir::new("virtual_seek");
+        let p1 = dir.path().join("part1.bin");
+        let p2 = dir.path().join("part2.bin");
+        std::fs::write(&p1, b"AAAAABBBBB").unwrap();
+        std::fs::write(&p2, b"CCCCCDDDDD").unwrap();
+
+        let extents = vec![
+            IsoExtent {
+                logical_start: 0,
+                byte_len: 5,
+                file_path: p1.clone(),
+                physical_offset: 5, // "BBBBB"
+            },
+            IsoExtent {
+                logical_start: 5,
+                byte_len: 5,
+                file_path: p2,
+                physical_offset: 0, // "CCCCC"
+            },
+        ];
+
+        let mut vs = IsoVirtualStream::new(extents).expect("IsoVirtualStream::new");
+        let mut buf = [0u8; 4];
+
+        // Seek across extent boundary using Start, Current, End
+        assert_eq!(vs.seek(SeekFrom::Start(3)).unwrap(), 3);
+        let n1 = vs.read(&mut buf).unwrap(); // capped at end of extent 0 -> 2 bytes "BB"
+        assert_eq!(n1, 2);
+        assert_eq!(&buf[..2], b"BB");
+
+        assert_eq!(vs.seek(SeekFrom::Current(1)).unwrap(), 6);
+        let n2 = vs.read(&mut buf[..3]).unwrap();
+        assert_eq!(n2, 3);
+        assert_eq!(&buf[..3], b"CCC");
+
+        assert_eq!(vs.seek(SeekFrom::End(-2)).unwrap(), 8);
+        let n3 = vs.read(&mut buf).unwrap();
+        assert_eq!(n3, 2);
+        assert_eq!(&buf[..2], b"CC");
+
+        // Negative seek returns InvalidInput
+        let neg_err = vs
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| vs.seek(SeekFrom::Current(-1)));
+        assert_eq!(
+            neg_err.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        // Seeking past total_len clamps to total_len and subsequent read returns 0
+        assert_eq!(vs.seek(SeekFrom::Start(999)).unwrap(), 10);
+        assert_eq!(vs.read(&mut buf).unwrap(), 0);
     }
 }

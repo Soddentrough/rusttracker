@@ -1673,4 +1673,50 @@ mod tests {
         assert_eq!(rgb_to_xterm256(0, 0, 0), 16);
         assert!(rgb_to_xterm256(255, 100, 20) >= 16);
     }
+
+    #[test]
+    fn test_tui_draw_tiny_and_zero_terminals_do_not_panic() {
+        let unloaded = AppState::new(String::new());
+        let mut loaded = AppState::new("tiny_test.flac".to_string());
+        loaded.file_loaded = true;
+        loaded.duration_seconds = 120.0;
+        loaded.current_seconds = 30.0;
+
+        for (w, h) in [(0, 0), (1, 1), (10, 4), (30, 10)] {
+            let mut term_unloaded = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term_unloaded.draw(|f| draw(f, &unloaded)).unwrap();
+
+            let mut term_loaded = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term_loaded.draw(|f| draw(f, &loaded)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_tui_draw_unloaded_and_lyrics_center_view() {
+        let unloaded = AppState::new(String::new());
+        let mut term_unloaded = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        term_unloaded.draw(|f| draw(f, &unloaded)).unwrap();
+
+        let mut state = AppState::new("song.flac".to_string());
+        state.file_loaded = true;
+        state.current_seconds = 12.0;
+        state.duration_seconds = 60.0;
+        state.lyrics = rt_core::lyrics::Lyrics::parse(
+            "[00:05.00]Previous line\n[00:10.00]Active lyric line\n[00:20.00]Next upcoming line\n",
+        )
+        .map(std::sync::Arc::new);
+        state.tui_center_view = Some(TuiCenterView::Lyrics);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        terminal.draw(|f| draw(f, &state)).unwrap();
+        let screen = buffer_to_string(&terminal);
+        assert!(
+            screen.contains("Active lyric line"),
+            "Expected active lyric line in Lyrics center view"
+        );
+        assert!(
+            screen.contains("Next upcoming line"),
+            "Expected upcoming lyric line in Lyrics center view"
+        );
+    }
 }

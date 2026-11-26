@@ -556,10 +556,82 @@ mod tests {
     }
 
     #[test]
+    fn test_build_ipc_payload_and_parse_error_matrix() {
+        assert_eq!(build_ipc_payload(&[]), None);
+        assert_eq!(
+            build_ipc_payload(&[
+                String::new(),
+                "bad\nline.mp3".to_string(),
+                "bad\rline.mp3".to_string(),
+                "x".repeat(MAX_IPC_LINE_BYTES + 1),
+            ]),
+            None
+        );
+
+        // Invalid entries are skipped while valid ones are preserved in order
+        let mixed = vec![
+            String::new(),
+            "bad\npath.mp3".to_string(),
+            "/ok/first.flac".to_string(),
+            "x".repeat(MAX_IPC_LINE_BYTES + 1),
+            "/ok/second.mod".to_string(),
+        ];
+        let payload = build_ipc_payload(&mixed).expect("valid payload expected");
+        let mut cursor = std::io::Cursor::new(payload.as_bytes());
+        assert_eq!(
+            parse_ipc_request(&mut cursor),
+            Some(vec![
+                "/ok/first.flac".to_string(),
+                "/ok/second.mod".to_string()
+            ])
+        );
+
+        // Stream cap enforcement
+        let large_entry = "z".repeat(4096);
+        let too_many: Vec<String> = (0..500).map(|_| large_entry.clone()).collect();
+        let capped_payload = build_ipc_payload(&too_many).expect("capped payload expected");
+        assert!(capped_payload.len() <= MAX_IPC_STREAM_BYTES as usize);
+
+        // parse_ipc_request error matrix
+        let invalid_frames: &[&[u8]] = &[
+            b"WRONG_HEADER\n1\n/a.mp3\n",
+            b"RUSTTRACKER_IPC_V1\n0\n/a.mp3\n",
+            b"RUSTTRACKER_IPC_V1\nnot_a_number\n/a.mp3\n",
+            b"RUSTTRACKER_IPC_V1\n4097\n/a.mp3\n",
+            b"RUSTTRACKER_IPC_V1\n2\n/a.mp3\n", // premature EOF before 2nd path
+            b"RUSTTRACKER_IPC_V1\n1\n\xff\xfe\n", // invalid UTF-8
+        ];
+        for frame in invalid_frames {
+            let mut c = std::io::Cursor::new(*frame);
+            assert_eq!(
+                parse_ipc_request(&mut c),
+                None,
+                "Expected frame to be rejected: {:?}",
+                frame
+            );
+        }
+
+        // CRLF frames are accepted cleanly
+        let crlf = b"RUSTTRACKER_IPC_V1\r\n2\r\n/a.mp3\r\n/b.flac\r\n";
+        let mut crlf_cursor = std::io::Cursor::new(&crlf[..]);
+        assert_eq!(
+            parse_ipc_request(&mut crlf_cursor),
+            Some(vec!["/a.mp3".to_string(), "/b.flac".to_string()])
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_ipc_communication_unix() {
         use std::io::Write;
         use std::os::unix::net::UnixStream;
+
+        struct SocketGuard(std::path::PathBuf);
+        impl Drop for SocketGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
 
         let unique_sock = std::env::temp_dir().join(format!(
             "rusttracker-test-{}-{}.sock",
@@ -569,15 +641,20 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
+        let _sock_guard = SocketGuard(unique_sock.clone());
 
         let (tx, rx) = crossbeam_channel::unbounded();
         unix_ipc::start_server_at(unique_sock.clone(), tx);
-        for _ in 0..20 {
+        for _ in 0..50 {
             if unique_sock.exists() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert!(
+            unique_sock.exists(),
+            "IPC test server socket did not appear in time"
+        );
 
         // 1. Adversarial huge count (e.g. usize::MAX) must be rejected immediately without OOM
         {

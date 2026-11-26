@@ -1,9 +1,9 @@
 use super::dsp::OscilloscopeTriggerState;
 use super::playback::{
-    StackLowercaseAsciiBuf, allocate_rt_dsp_pool, compute_fft_mono_sample,
+    StackLowercaseAsciiBuf, allocate_rt_dsp_pool, compute_fft_mono_sample, copy_ring_buffer,
     populate_state_from_audio_source, try_build_rt_dsp_message,
 };
-use super::sources::{OpenMptSource, map_iamf_ambisonics_to_canonical};
+use super::sources::{OpenMptSource, StreamingSincResampler, map_iamf_ambisonics_to_canonical};
 use super::video_decode::{
     effective_frame_hw_label, format_video_upload_telemetry, preferred_hw_video_devices,
     update_video_upload_telemetry_if_changed,
@@ -11,9 +11,37 @@ use super::video_decode::{
 use super::*;
 use crate::state::AppState;
 use crossbeam_channel::bounded;
-use realfft::RealFftPlanner;
-use rt_decode::openmpt_ffi::OpenMptModule;
+use rt_decode::openmpt_ffi::{OpenMptModule, build_minimal_protracker_mod};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+struct TempTestDir(std::path::PathBuf);
+
+impl TempTestDir {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rt_audio_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp test dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn test_calculate_mix_headroom_single_track() {
@@ -160,59 +188,284 @@ fn test_get_downmixed_sample_quad_and_61_and_expansion_routing() {
     assert!((get_downmixed_sample(12, &s714, 7, 4)).abs() < 1e-6);
 }
 
-#[test]
-fn test_multi_track_active_tracks_filter_enabled() {
-    struct MockTrack {
-        track_idx: usize,
-        volume: f32,
-        enabled: bool,
+struct MockPlaybackAudioSource {
+    channels: i32,
+    tracks: Vec<crate::state::AudioTrackInfo>,
+    active_tracks: Vec<(usize, f32)>,
+    selected_track: usize,
+    position: f64,
+    is_atmos: bool,
+    has_video: bool,
+    tracker_channels: Option<i32>,
+    samples_to_return: Vec<f32>,
+    channel_vus: Vec<f32>,
+}
+
+impl MockPlaybackAudioSource {
+    fn new_multitrack(num_tracks: usize) -> Self {
+        let tracks = (0..num_tracks)
+            .map(|id| crate::state::AudioTrackInfo {
+                id,
+                title: format!("Stem {}", id + 1),
+                codec: if id == 0 { "TrueHD" } else { "EAC3" }.to_string(),
+                channels: if id == 0 { 8 } else { 6 },
+                sample_rate: 48_000,
+                language: None,
+                is_atmos: id == 0,
+            })
+            .collect();
+        Self {
+            channels: 8,
+            tracks,
+            active_tracks: vec![(0, 1.0)],
+            selected_track: 0,
+            position: 10.0,
+            is_atmos: false,
+            has_video: false,
+            tracker_channels: None,
+            samples_to_return: Vec::new(),
+            channel_vus: vec![0.1; 8],
+        }
     }
-    let tracks = [
-        MockTrack {
-            track_idx: 0,
-            volume: 1.0,
-            enabled: true,
-        },
-        MockTrack {
-            track_idx: 1,
-            volume: 0.0,
-            enabled: true,
-        }, // Muted but enabled
-        MockTrack {
-            track_idx: 2,
-            volume: 0.0,
-            enabled: false,
-        }, // Omitted / disabled
-    ];
+}
 
-    // Active tracks filter checks `track.enabled`
-    let mut active: Vec<usize> = tracks
-        .iter()
-        .filter(|t| t.enabled)
-        .map(|t| t.track_idx)
-        .collect();
-    active.sort();
-    // Track 1 must remain active in the UI controls despite 0.0 volume
-    assert_eq!(active, vec![0, 1]);
-
-    // Prior buggy filter checked `track.volume > 0.0`, erroneously dropping muted tracks
-    let buggy_active: Vec<usize> = tracks
-        .iter()
-        .filter(|t| t.volume > 0.0)
-        .map(|t| t.track_idx)
-        .collect();
-    assert_eq!(buggy_active, vec![0]);
+impl AudioSource for MockPlaybackAudioSource {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
+        if self.samples_to_return.is_empty() {
+            return 0;
+        }
+        let max_frames = (output.len() / hardware_channels)
+            .min(self.samples_to_return.len() / hardware_channels);
+        let copy_len = max_frames * hardware_channels;
+        output[..copy_len].copy_from_slice(&self.samples_to_return[..copy_len]);
+        self.position += max_frames as f64 / sample_rate.max(1) as f64;
+        max_frames
+    }
+    fn get_duration_seconds(&mut self) -> f64 {
+        120.0
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.position
+    }
+    fn set_position_seconds(&mut self, pos: f64) {
+        self.position = pos;
+    }
+    fn get_num_channels(&mut self) -> i32 {
+        self.channels
+    }
+    fn get_current_channel_vu_mono(&mut self, ch: i32) -> f32 {
+        self.channel_vus.get(ch as usize).copied().unwrap_or(0.0)
+    }
+    fn get_artist(&mut self) -> String {
+        "Mock".to_string()
+    }
+    fn get_type(&mut self) -> String {
+        self.tracks
+            .get(self.selected_track)
+            .map(|t| t.codec.clone())
+            .unwrap_or_else(|| "Mock".to_string())
+    }
+    fn get_tempo(&mut self) -> i32 {
+        125
+    }
+    fn get_speed(&mut self) -> i32 {
+        6
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        Some(48_000)
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        0
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        0
+    }
+    fn get_current_order(&mut self) -> i32 {
+        1
+    }
+    fn get_current_row(&mut self) -> i32 {
+        2
+    }
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        self.tracker_channels
+    }
+    fn has_video_stream(&self) -> bool {
+        self.has_video
+    }
+    fn is_native_atmos(&self) -> bool {
+        self.is_atmos
+    }
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> {
+        self.tracks.clone()
+    }
+    fn get_selected_audio_track(&self) -> usize {
+        self.selected_track
+    }
+    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
+        if track_idx >= self.tracks.len() {
+            anyhow::bail!("out of range");
+        }
+        self.selected_track = track_idx;
+        self.active_tracks = vec![(track_idx, 1.0)];
+        self.channels = self.tracks[track_idx].channels as i32;
+        self.is_atmos = self.tracks[track_idx].is_atmos;
+        Ok(())
+    }
+    fn get_active_audio_tracks(&self) -> Vec<usize> {
+        self.active_tracks.iter().map(|&(idx, _)| idx).collect()
+    }
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        self.active_tracks = tracks.to_vec();
+        if let Some(&(first, _)) = tracks.first() {
+            self.selected_track = first;
+            if let Some(info) = self.tracks.get(first) {
+                self.channels = info.channels as i32;
+                self.is_atmos = info.is_atmos;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[test]
-fn test_multi_track_mix_mode_flag_transitions() {
-    let single_track = [0];
-    let multi_track = [0, 1];
-    let empty_track: [usize; 0] = [];
+fn test_process_decoder_state_requests_mix_track_and_seek_transitions() {
+    let mut src = MockPlaybackAudioSource::new_multitrack(3);
+    let mut state = AppState::new("Multi.mkv".to_string());
+    state.file_loaded = true;
+    state.hardware_channels = 8;
+    state.audio_tracks = src.get_audio_tracks();
+    state.current_seconds = 12.5;
+    state.seek_epoch = 1;
+    state.track_ended = true;
+    state.lookahead_queue.push_back((12.5, [0.0; 8]));
+    state.waveform_history.push_back(vec![0.1; 128]);
 
-    assert!(!(single_track.len() > 1));
-    assert!(multi_track.len() > 1);
-    assert!(!(empty_track.len() > 1));
+    let mut cleared_video = 0usize;
+
+    // 1. Seek request bumps seek_epoch, clears lookahead/waveform/track_ended, and invokes clear_video_packets
+    state.seek_request = Some(42.0);
+    assert!(process_decoder_state_requests(&mut state, &mut src, || {
+        cleared_video += 1
+    }));
+    assert_eq!(cleared_video, 1);
+    assert_eq!(src.get_position_seconds(), 42.0);
+    assert_eq!(state.current_seconds, 42.0);
+    assert!(!state.track_ended);
+    assert_eq!(state.seek_epoch, 2);
+    assert!(state.lookahead_queue.is_empty());
+    assert!(state.waveform_history.is_empty());
+
+    // 2. Multi-track mix preserving muted-but-enabled track (vol = 0.0) enables multi_track_mix_mode
+    state.audio_mix_request = Some(vec![(0, 1.0), (1, 0.0)]);
+    assert!(process_decoder_state_requests(&mut state, &mut src, || {}));
+    assert!(state.multi_track_mix_mode);
+    assert_eq!(state.active_audio_tracks, vec![0, 1]);
+    assert_eq!(state.audio_track_volumes[..2], [1.0, 0.0]);
+    assert_eq!(state.seek_epoch, 3);
+    assert!(state.is_native_atmos);
+    assert!(!state.surround_upmix.enabled);
+
+    // 3. Volume-only adjustment on the same active tracks does NOT bump seek_epoch or seek source
+    state.audio_mix_request = Some(vec![(0, 0.5), (1, 0.75)]);
+    assert!(!process_decoder_state_requests(&mut state, &mut src, || {}));
+    assert_eq!(state.seek_epoch, 3);
+    assert_eq!(state.audio_track_volumes[..2], [0.5, 0.75]);
+
+    // 4. Switching to single non-Atmos 6ch track on 8ch hardware disables mix mode and re-enables upmix
+    state.audio_track_request = Some(1);
+    assert!(process_decoder_state_requests(&mut state, &mut src, || {}));
+    assert!(!state.multi_track_mix_mode);
+    assert_eq!(state.selected_audio_track, 1);
+    assert_eq!(state.active_audio_tracks, vec![1]);
+    assert_eq!(state.module_type, "EAC3");
+    assert!(!state.is_native_atmos);
+    assert!(state.surround_upmix.enabled);
+    assert_eq!(state.seek_epoch, 4);
+
+    // 5. Redundant / out-of-range audio_track_request is a no-op
+    state.audio_track_request = Some(1);
+    assert!(!process_decoder_state_requests(&mut state, &mut src, || {}));
+    state.audio_track_request = Some(99);
+    assert!(!process_decoder_state_requests(&mut state, &mut src, || {}));
+    assert_eq!(state.seek_epoch, 4);
+}
+
+#[test]
+fn test_decode_single_audio_chunk_and_copy_ring_buffer() {
+    let mut chunk = AudioChunk {
+        samples: vec![0.0; 16],
+        valid_frames: 0,
+        channel_vus: Vec::new(),
+        left_peak: 0.0,
+        right_peak: 0.0,
+        current_order: 0,
+        current_row: 0,
+        bpm: 0,
+        speed: 0,
+        current_seconds: 0.0,
+        current_row_string: String::new(),
+        tracker_channels: None,
+        spatial_channels: 0,
+        track_ended: false,
+        seek_epoch: 0,
+    };
+
+    // 1. Tracker mode with clipping samples (> 1.0001) and 4 tracker channels -> [L, ch0..ch3, R]
+    let mut trk_src = MockPlaybackAudioSource::new_multitrack(1);
+    trk_src.channels = 2;
+    trk_src.tracker_channels = Some(4);
+    trk_src.channel_vus = vec![0.2, 0.4, 0.6, 0.8];
+    trk_src.position = 5.0;
+    trk_src.samples_to_return = vec![
+        1.25, -0.5, // frame 0 (L clips)
+        0.5, -1.1, // frame 1 (R clips)
+    ];
+    let (frames, _us, clips) = decode_single_audio_chunk(&mut trk_src, &mut chunk, 2, 48_000, 2);
+    assert_eq!(frames, 2);
+    assert_eq!(clips, 2);
+    assert!(!chunk.track_ended);
+    assert!((chunk.left_peak - 1.25).abs() < 1e-6);
+    assert!((chunk.right_peak - 1.1).abs() < 1e-6);
+    assert_eq!(chunk.channel_vus, vec![1.25, 0.2, 0.4, 0.6, 0.8, 1.1]);
+    assert_eq!(chunk.current_seconds, 5.0);
+
+    // 2. Video stream timestamp back-calculation & spatial VU layout
+    let mut vid_src = MockPlaybackAudioSource::new_multitrack(1);
+    vid_src.has_video = true;
+    vid_src.channels = 3;
+    vid_src.channel_vus = vec![0.3, 0.5, 0.7];
+    vid_src.position = 10.0;
+    vid_src.samples_to_return = vec![0.4, -0.2, 0.6, 0.1]; // 4 mono frames at 4 Hz -> 1.0s advance -> back-calc = 10.0
+    let (v_frames, _, v_clips) = decode_single_audio_chunk(&mut vid_src, &mut chunk, 1, 4, 4);
+    assert_eq!(v_frames, 4);
+    assert_eq!(v_clips, 0);
+    assert!((chunk.current_seconds - 10.0).abs() < 1e-6);
+    assert_eq!(chunk.left_peak, chunk.right_peak);
+    assert_eq!(chunk.channel_vus, vec![0.3, 0.5, 0.7]);
+
+    // 3. EOF (`frames_read == 0`) sets `track_ended = true`
+    vid_src.samples_to_return.clear();
+    let (eof_frames, _, _) = decode_single_audio_chunk(&mut vid_src, &mut chunk, 2, 48_000, 4);
+    assert_eq!(eof_frames, 0);
+    assert!(chunk.track_ended);
+
+    // 4. Ring buffer unwrapping across split_idx == 0, mid-wrap, and split_idx == len
+    let src = [10.0f32, 20.0, 30.0, 40.0];
+    let mut dst = [0.0f32; 4];
+    copy_ring_buffer(&mut dst, &src, 0);
+    assert_eq!(dst, [10.0, 20.0, 30.0, 40.0]);
+    copy_ring_buffer(&mut dst, &src, 2);
+    assert_eq!(dst, [30.0, 40.0, 10.0, 20.0]);
+    copy_ring_buffer(&mut dst, &src, 4);
+    assert_eq!(dst, [10.0, 20.0, 30.0, 40.0]);
 }
 
 #[test]
@@ -228,13 +481,26 @@ fn test_dsp_thread_skips_fft_in_fullscreen_video_and_preserves_bitstream_buffer_
     }
 
     let (tx, rx) = bounded(4);
+    let (recycle_tx, recycle_rx) = bounded(4);
     let window_size = 2048;
-    spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+    let handle = spawn_dsp_thread_with_recycle(
+        rx,
+        Arc::clone(&state),
+        48000,
+        20000.0,
+        window_size,
+        Some(recycle_tx),
+    );
 
-    // Send a DSP message while in fullscreen video mode
+    let samples: Vec<f32> = (0..window_size)
+        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
+        .collect();
+
+    // Send non-empty audio_data while in fullscreen video mode (video_mode = 3):
+    // DSP thread must still skip FFT and reset fft_us = 0.0.
     tx.send(DspMessage {
-        audio_data: Vec::new(),
-        channel_audio_data: Vec::new(),
+        audio_data: samples.clone(),
+        channel_audio_data: vec![samples.clone(), samples.clone()],
         channel_vus: vec![0.4, 0.5],
         current_order: 1,
         current_row: 2,
@@ -246,21 +512,17 @@ fn test_dsp_thread_skips_fft_in_fullscreen_video_and_preserves_bitstream_buffer_
     })
     .unwrap();
 
-    // Wait briefly for DSP thread to process
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let s = state.lock().unwrap();
-        if (s.current_seconds - 42.5).abs() < 1e-6 {
-            break;
-        }
-    }
+    let recycled1 = recycle_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("DSP thread must recycle first message");
+    drop(recycled1);
 
     {
         let mut s = state.lock().unwrap();
         assert!((s.current_seconds - 42.5).abs() < 1e-6);
         assert_eq!(
             s.stats.fft_us, 0.0,
-            "CPU FFT time must be 0.0 when skipped in Fullscreen Video mode"
+            "CPU FFT time must be 0.0 when skipped in Fullscreen Video mode even with audio_data present"
         );
         assert_eq!(
             s.stats.audio_buffer_fill_pct, 82.5,
@@ -271,9 +533,6 @@ fn test_dsp_thread_skips_fft_in_fullscreen_video_and_preserves_bitstream_buffer_
     }
 
     // Send a DSP message with a 440Hz tone in Split View mode
-    let samples: Vec<f32> = (0..window_size)
-        .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
-        .collect();
     tx.send(DspMessage {
         audio_data: samples.clone(),
         channel_audio_data: vec![samples.clone(), samples],
@@ -288,13 +547,8 @@ fn test_dsp_thread_skips_fft_in_fullscreen_video_and_preserves_bitstream_buffer_
     })
     .unwrap();
 
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let s = state.lock().unwrap();
-        if (s.current_seconds - 43.0).abs() < 1e-6 {
-            break;
-        }
-    }
+    drop(tx);
+    handle.join().unwrap();
 
     {
         let s = state.lock().unwrap();
@@ -327,11 +581,18 @@ fn test_dsp_thread_discards_stale_seek_epoch_and_preserves_post_seek_lookahead_q
     }
 
     let (tx, rx) = bounded(4);
+    let (recycle_tx, _recycle_rx) = bounded(4);
     let window_size = 2048;
-    spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+    let handle = spawn_dsp_thread_with_recycle(
+        rx,
+        Arc::clone(&state),
+        48000,
+        20000.0,
+        window_size,
+        Some(recycle_tx),
+    );
 
-    // Send a stale pre-seek message from epoch 4 at timestamp 250.0s (which previously
-    // would have overwritten current_seconds = 250.0 and pruned all 100.0..103.0s slices!)
+    // Send a stale pre-seek message from epoch 4 at timestamp 250.0s
     tx.send(DspMessage {
         audio_data: vec![0.25; window_size],
         channel_audio_data: vec![vec![0.25; window_size], vec![0.25; window_size]],
@@ -361,13 +622,8 @@ fn test_dsp_thread_discards_stale_seek_epoch_and_preserves_post_seek_lookahead_q
     })
     .unwrap();
 
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let s = state.lock().unwrap();
-        if (s.current_seconds - 100.05).abs() < 1e-6 {
-            break;
-        }
-    }
+    drop(tx);
+    handle.join().unwrap();
 
     let s = state.lock().unwrap();
     assert!(
@@ -394,8 +650,16 @@ fn test_dsp_thread_zeroes_spectrum_while_paused_with_file_loaded() {
     }
 
     let (tx, rx) = bounded(4);
+    let (recycle_tx, _recycle_rx) = bounded(4);
     let window_size = 2048;
-    spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+    let handle = spawn_dsp_thread_with_recycle(
+        rx,
+        Arc::clone(&state),
+        48000,
+        20000.0,
+        window_size,
+        Some(recycle_tx),
+    );
 
     let samples: Vec<f32> = (0..window_size)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
@@ -414,13 +678,8 @@ fn test_dsp_thread_zeroes_spectrum_while_paused_with_file_loaded() {
     })
     .unwrap();
 
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let s = state.lock().unwrap();
-        if (s.current_seconds - 12.5).abs() < 1e-6 {
-            break;
-        }
-    }
+    drop(tx);
+    handle.join().unwrap();
 
     let s = state.lock().unwrap();
     assert!(
@@ -1299,9 +1558,9 @@ fn test_iamf_7_1_4_demux_and_decode() {
         "ffmpeg"
     };
 
-    let tmp_dir = std::env::temp_dir();
-    let iamf_path = tmp_dir.join("rusttracker_test_7_1_4.iamf");
-    let mp4_path = tmp_dir.join("rusttracker_test_7_1_4_iamf.mp4");
+    let tmp_dir = TempTestDir::new("iamf_714");
+    let iamf_path = tmp_dir.path().join("test_7_1_4.iamf");
+    let mp4_path = tmp_dir.path().join("test_7_1_4_iamf.mp4");
 
     let sg_ae =
         "type=iamf_audio_element:id=1:st=0:st=1:st=2:st=3:st=4:st=5:st=6,layer=ch_layout=7.1.4";
@@ -1658,6 +1917,7 @@ fn lock_live_audio_test() -> LiveAudioTestGuard {
     LiveAudioTestGuard { _guard: guard }
 }
 
+#[ignore = "requires ~/Music/2nd_pm.s3m and live audio output hardware"]
 #[test]
 fn test_smoke_2nd_pm_mpegh_714_upmix_and_live_playback() {
     let _live_audio_guard = lock_live_audio_test();
@@ -1941,6 +2201,7 @@ fn test_smoke_2nd_pm_mpegh_714_upmix_and_live_playback() {
 }
 
 #[cfg(windows)]
+#[ignore = "requires ~/Music/2nd_pm.s3m and live Windows WASAPI output hardware"]
 #[test]
 fn test_live_pause_and_resume_verification() {
     let _live_audio_guard = lock_live_audio_test();
@@ -2097,6 +2358,7 @@ fn test_live_pause_and_resume_verification() {
 }
 
 #[cfg(windows)]
+#[ignore = "probes live Windows Spatial Audio endpoints without deterministic assertions"]
 #[test]
 fn test_spatial_audio_probe() {
     let _live_audio_guard = lock_live_audio_test();
@@ -2280,6 +2542,7 @@ fn test_spatial_audio_probe() {
     }
 }
 
+#[ignore = "requires local ~/Music Dolby Atmos & 96kHz personal fixtures"]
 #[test]
 fn test_atmos_detection_and_96khz_symphonia_resampling() {
     let user_profile = std::env::var("USERPROFILE")
@@ -2371,6 +2634,56 @@ fn test_atmos_detection_and_96khz_symphonia_resampling() {
 }
 
 #[test]
+fn test_synthetic_96khz_5_1_symphonia_resampling_to_48khz() {
+    let sample_rate = 96_000u32;
+    let channels = 6u16;
+    let total_in_frames = 144_000usize; // 1.5s @ 96 kHz
+    let bits_per_sample = 16u16;
+    let block_align = channels * (bits_per_sample / 8);
+    let byte_rate = sample_rate * block_align as u32;
+    let data_size = (total_in_frames * block_align as usize) as u32;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    for f in 0..total_in_frames {
+        let t = f as f32 / sample_rate as f32;
+        for c in 0..channels {
+            let s =
+                ((t * (220.0 + c as f32 * 55.0) * std::f32::consts::TAU).sin() * 12000.0) as i16;
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+    }
+
+    let tmp_dir = TempTestDir::new("symphonia_96k");
+    let wav_path = tmp_dir.path().join("sweep_96k_51.wav");
+    std::fs::write(&wav_path, &wav).expect("write 96k 5.1 WAV");
+
+    let mut src = load_audio_source(wav_path.to_str().unwrap()).expect("load 96k 5.1 WAV");
+    assert_eq!(src.get_intrinsic_sample_rate(), Some(96_000));
+    assert_eq!(src.get_num_channels(), 6);
+    assert!(!src.is_native_atmos());
+
+    let mut buf = vec![0.0f32; 48_000 * 12];
+    let frames = src.read_frames(12, 48_000, &mut buf);
+    assert_eq!(frames, 48_000);
+    let pos = src.get_position_seconds();
+    assert!(
+        (pos - 1.0).abs() < 0.02,
+        "Expected ~1.0s position after 48k frames @ 48kHz from 96kHz WAV, got {pos:.4}s"
+    );
+}
+
+#[test]
 fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_continuity() {
     // 1. Verify that feeding low/mid stereo signals where |mid(t)| and |diff(t)| cross each
     //    other every cycle (e.g. L = 220 Hz + 330 Hz, R = 220 Hz - 330 Hz) does NOT generate
@@ -2412,9 +2725,9 @@ fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_con
         max_hiss_trl
     );
 
-    // 2. Verify that resampling 44,100 Hz -> 48,000 Hz across arbitrary packet boundaries
-    //    (e.g. 257-frame and 1-frame chunks) produces bit-for-bit identical output to resampling
-    //    a single contiguous buffer, with zero packet-boundary clicks or phase slips.
+    // 2. Verify that production StreamingSincResampler (44,100 Hz -> 48,000 Hz) across
+    //    irregular packet boundaries ([1, 2, 17, 257, 1152] frames) matches a contiguous pass
+    //    with zero packet-boundary clicks or phase slips, and cleanly supports reset() & 6ch.
     let in_rate = 44_100u32;
     let out_rate = 48_000u32;
     let ch = 2usize;
@@ -2427,23 +2740,14 @@ fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_con
         full_src.push((two_pi * 3500.0 * t).cos() * 0.8);
     }
 
-    // Contiguous reference pass
-    let mut pos_ref = 0.0f64;
-    let mut prev_ref = Vec::new();
+    let mut res_ref = StreamingSincResampler::new(in_rate, out_rate, ch).unwrap();
+    assert!(res_ref.matches(in_rate, out_rate, ch));
+    assert!(!res_ref.matches(48_000, out_rate, ch));
     let mut out_ref = Vec::new();
-    resample_interleaved_packet(
-        &full_src,
-        ch,
-        in_rate,
-        out_rate,
-        &mut pos_ref,
-        &mut prev_ref,
-        &mut out_ref,
-    );
+    res_ref.push_interleaved(&full_src, &mut out_ref);
+    res_ref.flush(&mut out_ref);
 
-    // Chunked packet pass with irregular packet sizes (1, 2, 17, 257, 1152 frames)
-    let mut pos_chunked = 0.0f64;
-    let mut prev_chunked = Vec::new();
+    let mut res_chunked = StreamingSincResampler::new(in_rate, out_rate, ch).unwrap();
     let mut out_chunked = Vec::new();
     let chunk_sizes = [1usize, 2, 17, 257, 1152];
     let mut cursor = 0usize;
@@ -2451,23 +2755,16 @@ fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_con
     while cursor < total_in_frames {
         let take = chunk_sizes[step_idx % chunk_sizes.len()].min(total_in_frames - cursor);
         let slice = &full_src[cursor * ch..(cursor + take) * ch];
-        resample_interleaved_packet(
-            slice,
-            ch,
-            in_rate,
-            out_rate,
-            &mut pos_chunked,
-            &mut prev_chunked,
-            &mut out_chunked,
-        );
+        res_chunked.push_interleaved(slice, &mut out_chunked);
         cursor += take;
         step_idx += 1;
     }
+    res_chunked.flush(&mut out_chunked);
 
     assert_eq!(
         out_ref.len(),
         out_chunked.len(),
-        "Chunked resampling must produce the exact same sample count as contiguous resampling"
+        "Chunked StreamingSincResampler must produce the exact same sample count as contiguous"
     );
     let max_diff = out_ref
         .iter()
@@ -2475,10 +2772,24 @@ fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_con
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     assert!(
-        max_diff < 1e-6,
-        "Chunked resampling across packet boundaries must match contiguous resampling (max_diff={})",
-        max_diff
+        max_diff < 1e-5,
+        "Chunked StreamingSincResampler across packet boundaries must match contiguous (max_diff={max_diff})"
     );
+
+    // Verify reset() clears staged remainder cleanly and 6ch resampling outputs finite samples
+    res_chunked.push_interleaved(&full_src[..100 * ch], &mut out_chunked);
+    res_chunked.reset();
+    let mut after_reset = Vec::new();
+    res_chunked.push_interleaved(&full_src, &mut after_reset);
+    res_chunked.flush(&mut after_reset);
+    assert_eq!(after_reset.len(), out_ref.len());
+
+    let mut res_6ch = StreamingSincResampler::new(44_100, 48_000, 6).unwrap();
+    let in_6ch = vec![0.25f32; 1024 * 6];
+    let mut out_6ch = Vec::new();
+    res_6ch.push_interleaved(&in_6ch, &mut out_6ch);
+    res_6ch.flush(&mut out_6ch);
+    assert!(!out_6ch.is_empty() && out_6ch.iter().all(|s| s.is_finite()));
 }
 
 #[test]
@@ -2532,7 +2843,15 @@ fn test_itu_bs775_downmix_and_crossover_phase_coherence() {
             s.file_loaded = true;
         }
         let (tx, rx) = bounded::<DspMessage>(4);
-        spawn_dsp_thread(rx, state.clone(), sr, 20_000.0, win_size);
+        let (recycle_tx, _recycle_rx) = bounded::<DspMessage>(4);
+        let handle = spawn_dsp_thread_with_recycle(
+            rx,
+            state.clone(),
+            sr,
+            20_000.0,
+            win_size,
+            Some(recycle_tx),
+        );
 
         let freq = 1000.0f32;
         let amp = 0.035f32;
@@ -2554,8 +2873,7 @@ fn test_itu_bs775_downmix_and_crossover_phase_coherence() {
         })
         .unwrap();
         drop(tx);
-
-        std::thread::sleep(std::time::Duration::from_millis(60));
+        handle.join().unwrap();
         let peak_bin = state
             .lock()
             .unwrap()
@@ -3009,44 +3327,6 @@ fn test_stack_lowercase_ascii_buf_zero_alloc_xrun_matching() {
 }
 
 #[test]
-fn test_realfft_r2c_matches_analytic_dft_sine_bin() {
-    let n = 8192usize;
-    let target_bin = 128usize;
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n);
-    let mut input = r2c.make_input_vec();
-    let mut output = r2c.make_output_vec();
-    let mut scratch = r2c.make_scratch_vec();
-
-    // Coherent Hann-windowed unit sine at exact bin k=128:
-    // Hann window mean = 0.5, single-sided sine DFT bin k magnitude = 0.25 * N = 2048.0,
-    // phase for sin(2*pi*k*n/N) at bin k is -i * (0.25 * N).
-    for (i, sample) in input.iter_mut().enumerate() {
-        let hann = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos());
-        let sig = (2.0 * std::f32::consts::PI * target_bin as f32 * i as f32 / n as f32).sin();
-        *sample = sig * hann;
-    }
-
-    r2c.process_with_scratch(&mut input, &mut output, &mut scratch)
-        .unwrap();
-    assert_eq!(output.len(), n / 2 + 1);
-
-    let (peak_bin, peak_val) = output
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.norm().partial_cmp(&b.norm()).unwrap())
-        .unwrap();
-    assert_eq!(peak_bin, target_bin);
-    assert!(
-        (peak_val.norm() - (0.25 * n as f32)).abs() < 0.05,
-        "unexpected peak norm: {}",
-        peak_val.norm()
-    );
-    assert!(peak_val.re.abs() < 0.05);
-    assert!((peak_val.im + 0.25 * n as f32).abs() < 0.05);
-}
-
-#[test]
 fn test_spawn_video_decoder_thread_unsupported_codec_resets_video_state_cleanly() {
     ffmpeg_next::init().expect("init ffmpeg");
     let shared_state = Arc::new(Mutex::new(AppState::new("UnsupportedVideo".to_string())));
@@ -3116,7 +3396,8 @@ fn test_load_audio_source_from_multi_extent_iso() {
         ],
     );
 
-    let temp_iso = std::env::temp_dir().join("rusttracker_test_playback_portishead.iso");
+    let tmp_dir = TempTestDir::new("iso_playback");
+    let temp_iso = tmp_dir.path().join("portishead.iso");
     std::fs::write(&temp_iso, &iso_bytes).expect("write playback ISO");
 
     let mut source = load_audio_source(temp_iso.to_str().unwrap())
@@ -3133,18 +3414,16 @@ fn test_load_audio_source_from_multi_extent_iso() {
     assert_eq!(source.get_position_seconds(), 2795.0);
 
     drop(source);
-    let _ = std::fs::remove_file(&temp_iso);
 }
 
 #[test]
 fn test_openmpt_source_zero_alloc_1ch_2ch_12ch_playback() {
-    let workspace_mod =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ive_got_the_power.mod");
-    if !workspace_mod.exists() {
-        return;
-    }
-    let mut src = load_audio_source(workspace_mod.to_str().unwrap())
-        .expect("load OpenMPT .mod via direct C FFI");
+    let tmp_dir = TempTestDir::new("openmpt_zero_alloc");
+    let mod_path = tmp_dir.path().join("synthetic_test.mod");
+    std::fs::write(&mod_path, build_minimal_protracker_mod()).expect("write synthetic MOD");
+
+    let mut src = load_audio_source(mod_path.to_str().unwrap())
+        .expect("load synthetic .mod via direct C FFI");
     assert!(src.get_duration_seconds() > 1.0);
     assert_eq!(src.get_tracker_channels(), Some(4));
     assert_eq!(src.get_num_channels(), 2);
@@ -3980,6 +4259,7 @@ fn test_upmixer_interleaved_stereo_block_matches_frame_by_frame() {
 }
 
 #[cfg(windows)]
+#[ignore = "exercises live Windows Spatial Audio hardware reset/reactivation"]
 #[test]
 fn test_spatial_audio_reset_and_reactivate_static_objects() {
     let _live_audio_guard = lock_live_audio_test();

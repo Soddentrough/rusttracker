@@ -540,8 +540,8 @@ impl OpenMptModule {
 
 /// Builds a self-contained, valid 4-channel ProTracker (`M.K.`) `.MOD` module in memory
 /// with a non-silent square-wave sample and C-5 note trigger on row 0 channel 0.
-#[cfg(test)]
-pub(crate) fn build_minimal_protracker_mod() -> Vec<u8> {
+#[doc(hidden)]
+pub fn build_minimal_protracker_mod() -> Vec<u8> {
     // 1084-byte header + 1 pattern (64 rows * 4 ch * 4 B = 1024 B) + 32-byte sample = 2140 B
     let mut mod_bytes = vec![0u8; 1084 + 1024 + 32];
     // Song title (20 bytes)

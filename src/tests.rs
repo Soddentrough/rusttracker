@@ -1753,3 +1753,50 @@ fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
     assert!(!ipc_state.track_ended);
     assert!(!ipc_state.rt_control.take_track_ended());
 }
+
+#[test]
+fn test_cli_matches_visualizer_spec_and_absolutize_ipc_paths() {
+    use super::cli::{absolutize_ipc_paths, matches_visualizer_spec};
+
+    // Empty / unknown specs return None
+    assert_eq!(matches_visualizer_spec(""), None);
+    assert_eq!(matches_visualizer_spec("   "), None);
+    assert_eq!(matches_visualizer_spec("no_such_visualizer_xyz"), None);
+
+    // Numeric ID, full name, punctuation-normalized, short stem, and special aliases
+    let lyrics_idx = matches_visualizer_spec("23").expect("ID 23 must resolve");
+    assert_eq!(crate::state::VISUALIZERS[lyrics_idx].id, 23);
+    assert_eq!(
+        matches_visualizer_spec("3D Glass Water Lyrics"),
+        Some(lyrics_idx)
+    );
+    assert_eq!(matches_visualizer_spec("lyrics"), Some(lyrics_idx));
+
+    let fire_idx = matches_visualizer_spec("doom").expect("'doom' alias must resolve to ID 5");
+    assert_eq!(crate::state::VISUALIZERS[fire_idx].id, 5);
+    assert_eq!(matches_visualizer_spec("PSX Fire"), Some(fire_idx));
+
+    let ferro_idx = matches_visualizer_spec("ferrofluid").expect("'ferrofluid' alias -> ID 27");
+    assert_eq!(crate::state::VISUALIZERS[ferro_idx].id, 27);
+
+    let neon_idx = matches_visualizer_spec("neonroom").expect("'neonroom' alias -> ID 31");
+    assert_eq!(crate::state::VISUALIZERS[neon_idx].id, 31);
+
+    // Absolutize relative paths while leaving URIs and absolute paths intact
+    let cwd = std::env::current_dir().expect("cwd");
+    let inputs = vec![
+        "http://example.com/stream.mp3".to_string(),
+        "https://example.com/live".to_string(),
+        "file:///tmp/song.flac".to_string(),
+        "mic://default".to_string(),
+        "/abs/path/track.mod".to_string(),
+        "rel/sub/track.xm".to_string(),
+    ];
+    let out = absolutize_ipc_paths(&inputs);
+    assert_eq!(out[0], inputs[0]);
+    assert_eq!(out[1], inputs[1]);
+    assert_eq!(out[2], inputs[2]);
+    assert_eq!(out[3], inputs[3]);
+    assert_eq!(out[4], inputs[4]);
+    assert_eq!(out[5], cwd.join("rel/sub/track.xm").to_string_lossy());
+}

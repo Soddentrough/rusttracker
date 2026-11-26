@@ -8,6 +8,35 @@ pub type BitstreamLaunchResult = (
     f64,
 );
 
+#[cfg(any(target_os = "linux", test))]
+fn select_linux_bitstream_carrier(
+    codec_id: ffmpeg_next::codec::Id,
+    raw_profile: i32,
+) -> anyhow::Result<(&'static str, u32, u16)> {
+    let codec_name = match codec_id {
+        ffmpeg_next::codec::Id::TRUEHD => "truehd",
+        ffmpeg_next::codec::Id::EAC3 => "eac3",
+        ffmpeg_next::codec::Id::DTS => "dts",
+        ffmpeg_next::codec::Id::AC3 => "ac3",
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Unsupported codec for bitstreaming: {:?}",
+                codec_id
+            ));
+        }
+    };
+    let (pw_rate, pw_channels): (u32, u16) = match codec_name {
+        "truehd" => (192000, 8),
+        "eac3" => (192000, 2),
+        // DTS-HD HRA (50), MA (60), MA X (61), MA X IMAX (62) use 8-channel 192 kHz HBR IEC 61937 carrier;
+        // Core DTS / ES / 96_24 use 2-channel 48 kHz carrier.
+        "dts" if matches!(raw_profile, 50 | 60 | 61 | 62) => (192000, 8),
+        "dts" | "ac3" => (48000, 2),
+        _ => (48000, 2),
+    };
+    Ok((codec_name, pw_rate, pw_channels))
+}
+
 #[cfg(target_os = "linux")]
 pub fn start_bitstream_thread(
     file_path: &str,
@@ -53,19 +82,12 @@ pub fn start_bitstream_thread(
         .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
 
     let codec_id = best_audio.parameters().id();
-    let codec_name = match codec_id {
-        ffmpeg_next::codec::Id::TRUEHD => "truehd",
-        ffmpeg_next::codec::Id::EAC3 => "eac3",
-        ffmpeg_next::codec::Id::DTS => "dts",
-        ffmpeg_next::codec::Id::AC3 => "ac3",
-        _ => {
-            return Err(anyhow::anyhow!(
-                "Unsupported codec for bitstreaming: {:?}",
-                codec_id
-            ));
-        }
-    }
-    .to_string();
+    let parameters = best_audio.parameters();
+    let best_audio_index = best_audio.index();
+    let raw_profile = unsafe { (*parameters.as_ptr()).profile };
+    let (codec_name_static, pw_rate, pw_channels) =
+        select_linux_bitstream_carrier(codec_id, raw_profile)?;
+    let codec_name = codec_name_static.to_string();
 
     let mut meta_duration = if ictx.duration() > 0 {
         ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
@@ -90,8 +112,6 @@ pub fn start_bitstream_thread(
     let has_video = video_setup.is_some();
 
     let mut audio_bitrate_kbps = crate::audio::probe_stream_bitrate_kbps(&best_audio);
-    let parameters = best_audio.parameters();
-    let best_audio_index = best_audio.index();
 
     let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
         .context("Failed to create probe context")?;
@@ -140,16 +160,6 @@ pub fn start_bitstream_thread(
         state.stats.video_bitrate_kbps = video_bitrate_kbps;
     }
 
-    let raw_profile = unsafe { (*parameters.as_ptr()).profile };
-    let (pw_rate, pw_channels): (u32, u16) = match codec_name.as_str() {
-        "truehd" => (192000, 8),
-        "eac3" => (192000, 2),
-        // DTS-HD HRA (50), MA (60), MA X (61), MA X IMAX (62) use 8-channel 192 kHz HBR IEC 61937 carrier;
-        // Core DTS / ES / 96_24 use 2-channel 48 kHz carrier.
-        "dts" if matches!(raw_profile, 50 | 60 | 61 | 62) => (192000, 8),
-        "dts" | "ac3" => (48000, 2),
-        _ => (48000, 2),
-    };
     println!(
         "[bitstream] Codec: {}, Decoder Rate: {}, Output Carrier: {}ch @ {}Hz",
         codec_name, decoder_sample_rate, pw_channels, pw_rate
@@ -2832,5 +2842,56 @@ mod tests {
             "Expected EPIPE write error to surface cleanly from S/PDIF muxer"
         );
         spdif_out.abort_flush = true;
+    }
+
+    #[test]
+    fn test_select_linux_bitstream_carrier_matrix() {
+        use ffmpeg_next::codec::Id;
+
+        assert_eq!(
+            select_linux_bitstream_carrier(Id::TRUEHD, 0).unwrap(),
+            ("truehd", 192_000, 8)
+        );
+        assert_eq!(
+            select_linux_bitstream_carrier(Id::EAC3, 0).unwrap(),
+            ("eac3", 192_000, 2)
+        );
+        assert_eq!(
+            select_linux_bitstream_carrier(Id::AC3, 0).unwrap(),
+            ("ac3", 48_000, 2)
+        );
+        assert_eq!(
+            select_linux_bitstream_carrier(Id::DTS, 20).unwrap(),
+            ("dts", 48_000, 2)
+        );
+        for dts_hd_profile in [50, 60, 61, 62] {
+            assert_eq!(
+                select_linux_bitstream_carrier(Id::DTS, dts_hd_profile).unwrap(),
+                ("dts", 192_000, 8)
+            );
+        }
+        for unsupported in [Id::FLAC, Id::AAC, Id::MP3] {
+            assert!(
+                select_linux_bitstream_carrier(unsupported, 0).is_err(),
+                "Expected unsupported codec {unsupported:?} to return Err"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_start_bitstream_thread_rejects_when_force_stereo_downmix() {
+        let mut st = crate::state::AppState::new("dummy.ac3".to_string());
+        st.force_stereo_downmix = true;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(st));
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let res = start_bitstream_thread("nonexistent.ac3", shared, tx, stop);
+        let err = match res {
+            Ok(_) => panic!("Expected early rejection when force_stereo_downmix is enabled"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("Force stereo downmix"));
     }
 }

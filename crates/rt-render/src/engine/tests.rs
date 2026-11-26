@@ -118,50 +118,52 @@ fn test_timing_and_scroll_stability() {
     let mut raw_deltas = Vec::new();
     let mut smooth_deltas = Vec::new();
 
-    // Simulate 100 frames with CPU scheduling noise
+    // Simulate 100 frames with CPU scheduling noise through production step_smooth_frame_time
     for i in 0..100 {
-        // Deterministic pseudo-random jitter between 13ms and 20ms using a sine phase
         let phase = (i as f64) * 0.73;
         let jitter = phase.sin() * 0.0035; // +/- 3.5ms
-        let dt = 0.01667 + jitter;
+        let dt = (0.01667 + jitter) as f32;
 
         let prev_raw = raw_time;
-        raw_time += dt;
+        raw_time += dt as f64;
         raw_deltas.push(raw_time - prev_raw);
 
-        let alpha = 0.03f64;
         let prev_smooth = smooth_time;
-        smooth_dt = smooth_dt * (1.0 - alpha) + dt.clamp(0.001, 0.1) * alpha;
-        smooth_time += smooth_dt;
+        let clamped_dt = VulkanEngine::step_smooth_frame_time(&mut smooth_dt, &mut smooth_time, dt);
+        assert!((0.0005..=0.1).contains(&clamped_dt));
         smooth_deltas.push(smooth_time - prev_smooth);
     }
 
-    // Calculate second derivative (acceleration / velocity change) of the timeline
     let mut raw_accelerations = Vec::new();
     let mut smooth_accelerations = Vec::new();
     for i in 1..99 {
-        let acc_raw = raw_deltas[i] - raw_deltas[i - 1];
-        let acc_smooth = smooth_deltas[i] - smooth_deltas[i - 1];
-        raw_accelerations.push(acc_raw.abs());
-        smooth_accelerations.push(acc_smooth.abs());
+        raw_accelerations.push((raw_deltas[i] - raw_deltas[i - 1]).abs());
+        smooth_accelerations.push((smooth_deltas[i] - smooth_deltas[i - 1]).abs());
     }
 
     let max_raw_acc = raw_accelerations.iter().cloned().fold(0.0, f64::max);
     let max_smooth_acc = smooth_accelerations.iter().cloned().fold(0.0, f64::max);
 
-    println!("Max raw frame-to-frame velocity jump: {:.6}s", max_raw_acc);
-    println!(
-        "Max smoothed frame-to-frame velocity jump: {:.6}s",
-        max_smooth_acc
-    );
-
-    // Smooth timelines must have at least 15x lower frame-to-frame velocity jumps
     assert!(
         max_smooth_acc < max_raw_acc / 15.0,
-        "The timing filter did not damp frame-to-frame velocity changes sufficiently: smooth={:.6}, raw={:.6}",
+        "step_smooth_frame_time did not damp frame-to-frame velocity changes sufficiently: smooth={:.6}, raw={:.6}",
         max_smooth_acc,
         max_raw_acc
     );
+
+    // Verify extreme dt clamping (0.0 -> 0.001, 10.0 -> 0.1) and HOST_TIME_WRAP_PERIOD_SECS wrapping
+    let mut wrap_dt = 0.05f64;
+    let mut wrap_time = HOST_TIME_WRAP_PERIOD_SECS - 0.01;
+    let clamped_hi = VulkanEngine::step_smooth_frame_time(&mut wrap_dt, &mut wrap_time, 10.0);
+    assert!(clamped_hi <= 0.1);
+    assert!(
+        (0.0..HOST_TIME_WRAP_PERIOD_SECS).contains(&wrap_time),
+        "smooth_time must wrap modulo HOST_TIME_WRAP_PERIOD_SECS, got {wrap_time}"
+    );
+    let mut zero_dt = 0.001f64;
+    let mut zero_time = 0.0f64;
+    let clamped_lo = VulkanEngine::step_smooth_frame_time(&mut zero_dt, &mut zero_time, 0.0);
+    assert!((clamped_lo - 0.001).abs() < 1e-6);
 }
 
 #[test]
@@ -237,19 +239,32 @@ fn test_drag_and_drop_use_cases() {
 
 #[test]
 fn test_view_mode_rotation() {
+    use crate::state::TuiCenterView;
+
     let mut state = crate::state::AppState::new("Test App".to_string());
     assert!(state.show_hud);
     assert_eq!(state.video_mode, 0);
+    assert_eq!(state.effective_tui_center_view(), TuiCenterView::Heatmap);
 
-    // Press 'v' in audio mode -> Toggle HUD off (Full Screen Visualizer)
-    state.show_hud = !state.show_hud;
-    state.video_mode = 0;
-    assert!(!state.show_hud);
+    // Cycle Heatmap -> SurroundEq -> Heatmap when no lyrics or tracker patterns exist
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::SurroundEq);
+    assert!(state.show_surround_eq);
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::Heatmap);
+    assert!(!state.show_surround_eq);
 
-    // Press 'v' again -> Toggle HUD back on (Standard View)
-    state.show_hud = !state.show_hud;
-    state.video_mode = 0;
-    assert!(state.show_hud);
+    // Adding tracker patterns inserts Tracker before Heatmap & SurroundEq
+    state.tracker_patterns_by_order = std::sync::Arc::new(vec![vec!["C-5 01 ..".to_string()]]);
+    state.tui_center_view = None;
+    assert_eq!(state.effective_tui_center_view(), TuiCenterView::Tracker);
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::Heatmap);
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::SurroundEq);
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::Tracker);
+
+    // Adding lyrics puts Lyrics first in the cycle
+    state.lyrics = Some(std::sync::Arc::new(crate::lyrics::Lyrics::default()));
+    state.tui_center_view = None;
+    assert_eq!(state.effective_tui_center_view(), TuiCenterView::Lyrics);
+    assert_eq!(state.cycle_tui_center_view(), TuiCenterView::Tracker);
 }
 
 #[test]
@@ -406,145 +421,143 @@ fn test_mobile_visualizer_fixes() {
 
 #[test]
 fn test_quick_mix_presets_layout() {
-    // Verify that in compact / mobile mode, preset widths and rows never overflow available width
-    let mobile_widths = [280.0_f32, 320.0, 360.0, 400.0];
-    let spacing = 6.0_f32;
+    use super::ui_overlay::render_quick_mix_presets;
 
-    for &width in &mobile_widths {
-        // 2 tracks: 2 buttons per row, 2 rows
-        let row_w = ((width - spacing) / 2.0).max(60.0);
-        let row_total = row_w * 2.0 + spacing;
-        assert!(
-            row_total <= width + 0.01,
-            "Row width {} must fit in available width {}",
-            row_total,
-            width
-        );
+    let make_tracks = |n: usize| -> Vec<crate::state::AudioTrackInfo> {
+        (0..n)
+            .map(|id| crate::state::AudioTrackInfo {
+                id,
+                title: format!("Track {}", id + 1),
+                codec: "AAC".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                language: None,
+                is_atmos: false,
+            })
+            .collect()
+    };
 
-        // 4 tracks: Row 1 has 2 buttons, Row 2 has 2 buttons, Row 3 has 2 buttons
-        let chunk_w = ((width - spacing) / 2.0).max(45.0);
-        let chunk_total = chunk_w * 2.0 + spacing;
-        assert!(
-            chunk_total <= width + 0.01,
-            "Chunk width {} must fit in available width {}",
-            chunk_total,
-            width
-        );
+    for track_count in [2usize, 3, 4] {
+        for avail_w in [280.0_f32, 320.0, 360.0, 460.0] {
+            let ctx = egui::Context::default();
+            let mut state = AppState::new("Mix.mkv".to_string());
+            state.audio_tracks = make_tracks(track_count);
+            state.active_audio_tracks = vec![0, 1];
+            let mut container_rect = egui::Rect::NOTHING;
+            let mut presets_rect = egui::Rect::NOTHING;
+            let mut actions = Vec::new();
+            let raw_input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(800.0, 400.0),
+                )),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = ui.allocate_ui_with_layout(
+                        egui::vec2(avail_w, 220.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            container_rect = ui.max_rect();
+                            presets_rect = render_quick_mix_presets(ui, &state, &mut actions);
+                        },
+                    );
+                });
+            });
+            out.textures_delta.clear();
+            assert!(actions.is_empty());
+            assert!(
+                presets_rect.right() <= container_rect.right() + 1.0,
+                "tracks={track_count}, avail_w={avail_w}: presets_rect.right() ({}) exceeded container_rect.right() ({})",
+                presets_rect.right(),
+                container_rect.right()
+            );
+            assert!(presets_rect.height() > 30.0);
+        }
     }
 }
 
 #[test]
 fn test_mobile_audio_info_formatting() {
-    // Verify mobile portrait single-line audio format string e.g. "Audio: AAC/MP4, X-channels, Y bitrate"
-    let format_audio_line = |module_type: &str,
-                             codec: Option<&str>,
-                             bitrate: Option<u32>,
-                             num_channels: usize,
-                             tracker_channels: Option<usize>,
-                             hardware_channels: usize|
-     -> (String, String) {
-        let format_name = if let Some(c) = codec {
-            if !c.is_empty() && !module_type.eq_ignore_ascii_case(c) {
-                format!("{}/{}", c, module_type)
-            } else {
-                module_type.to_string()
-            }
-        } else {
-            module_type.to_string()
-        };
+    use super::ui_overlay::format_track_audio_summary;
 
-        let ch_info = if let Some(tc) = tracker_channels {
-            format!("{} hw / {} tracker", hardware_channels, tc)
-        } else if num_channels == 1 {
-            "1-channel".to_string()
-        } else {
-            format!("{}-channels", num_channels)
-        };
-
-        let audio_val = if let Some(br) = bitrate {
-            format!("{}, {}, {} kbps", format_name, ch_info, br)
-        } else {
-            format!("{}, {}", format_name, ch_info)
-        };
-
-        ("Audio:".to_string(), audio_val)
+    let make_track = |codec: &str| crate::state::AudioTrackInfo {
+        id: 0,
+        title: "Main".to_string(),
+        codec: codec.to_string(),
+        channels: 2,
+        sample_rate: 48_000,
+        language: None,
+        is_atmos: false,
     };
 
     // Case 1: AAC in MP4 container with bitrate
-    let (label, val) = format_audio_line("MP4", Some("AAC"), Some(256), 2, None, 2);
-    assert_eq!(label, "Audio:");
-    assert_eq!(val, "AAC/MP4, 2-channels, 256 kbps");
+    let mut s1 = AppState::new("song.mp4".to_string());
+    s1.module_type = "MP4".to_string();
+    s1.audio_tracks = vec![make_track("AAC")];
+    s1.num_channels = 2;
+    let (fmt1, ch1, mob1) =
+        format_track_audio_summary(&s1, std::path::Path::new("song.mp4"), Some(256));
+    assert_eq!(fmt1, "AAC/MP4");
+    assert_eq!(ch1, "2-channels");
+    assert_eq!(mob1, "AAC/MP4, 2-channels, 256 kbps");
 
-    // Case 2: FLAC, 1-channel with bitrate
-    let (_, val) = format_audio_line("FLAC", Some("FLAC"), Some(98), 1, None, 1);
-    assert_eq!(val, "FLAC, 1-channel, 98 kbps");
+    // Case 2: FLAC 1-channel with bitrate
+    let mut s2 = AppState::new("mono.flac".to_string());
+    s2.module_type = "FLAC".to_string();
+    s2.audio_tracks = vec![make_track("FLAC")];
+    s2.num_channels = 1;
+    let (fmt2, ch2, mob2) =
+        format_track_audio_summary(&s2, std::path::Path::new("mono.flac"), Some(98));
+    assert_eq!(fmt2, "FLAC");
+    assert_eq!(ch2, "1-channel");
+    assert_eq!(mob2, "FLAC, 1-channel, 98 kbps");
 
-    // Case 3: MP3 with bitrate
-    let (_, val) = format_audio_line("MP3", None, Some(320), 2, None, 2);
-    assert_eq!(val, "MP3, 2-channels, 320 kbps");
+    // Case 3: MP3 without audio_tracks metadata
+    let mut s3 = AppState::new("track.mp3".to_string());
+    s3.module_type = "MP3".to_string();
+    s3.num_channels = 2;
+    let (_, _, mob3) =
+        format_track_audio_summary(&s3, std::path::Path::new("track.mp3"), Some(320));
+    assert_eq!(mob3, "MP3, 2-channels, 320 kbps");
 
     // Case 4: Tracker module with hardware/tracker channel breakdown (no bitrate)
-    let (_, val) = format_audio_line("ProTracker MOD", None, None, 4, Some(4), 4);
-    assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
+    let mut s4 = AppState::new("demo.mod".to_string());
+    s4.module_type = "ProTracker MOD".to_string();
+    s4.hardware_channels = 4;
+    s4.tracker_channels = Some(4);
+    let (_, _, mob4) = format_track_audio_summary(&s4, std::path::Path::new("demo.mod"), None);
+    assert_eq!(mob4, "ProTracker MOD, 4 hw / 4 tracker");
 
-    // Case 5: Composite module_type already containing codec (avoid AAC/AAC/MP4)
-    let format_audio_line_dedup = |module_type: &str,
-                                   codec: Option<&str>,
-                                   bitrate: Option<u32>,
-                                   num_channels: usize|
-     -> String {
-        let format_name = if let Some(c) = codec {
-            if !c.is_empty()
-                && !module_type
-                    .to_ascii_uppercase()
-                    .contains(&c.to_ascii_uppercase())
-            {
-                format!("{}/{}", c, module_type)
-            } else {
-                module_type.to_string()
-            }
-        } else {
-            module_type.to_string()
-        };
-        if let Some(br) = bitrate {
-            format!("{}, {}-channels, {} kbps", format_name, num_channels, br)
-        } else {
-            format!("{}, {}-channels", format_name, num_channels)
-        }
-    };
-    let val = format_audio_line_dedup("AAC/MP4", Some("AAC"), Some(788), 2);
-    assert_eq!(val, "AAC/MP4, 2-channels, 788 kbps");
+    // Case 5: Composite module_type already containing codec & extension avoids duplication
+    let mut s5 = AppState::new("clip.mp4".to_string());
+    s5.module_type = "AAC/MP4".to_string();
+    s5.audio_tracks = vec![make_track("AAC")];
+    s5.num_channels = 2;
+    let (_, _, mob5) = format_track_audio_summary(&s5, std::path::Path::new("clip.mp4"), Some(788));
+    assert_eq!(mob5, "AAC/MP4, 2-channels, 788 kbps");
 
-    // Case 6: When module_type is "AAC" and file extension is "mp4", container is retained
-    let format_audio_with_ext = |format_name: &str, ext: Option<&str>| -> String {
-        if let Some(e) = ext {
-            let ext_upper = e.to_ascii_uppercase();
-            if (ext_upper == "MP4"
-                || ext_upper == "M4A"
-                || ext_upper == "MOV"
-                || ext_upper == "MKV")
-                && !format_name.to_ascii_uppercase().contains(&ext_upper)
-            {
-                format!("{}/{}", format_name, ext_upper)
-            } else {
-                format_name.to_string()
-            }
-        } else {
-            format_name.to_string()
-        }
-    };
-    assert_eq!(format_audio_with_ext("AAC", Some("mp4")), "AAC/MP4");
-    assert_eq!(format_audio_with_ext("AAC/MP4", Some("mp4")), "AAC/MP4");
+    // Case 6: Native Dolby Atmos and MPEG-H 7.1.4 formatting
+    let mut s6 = AppState::new("atmos.mkv".to_string());
+    s6.module_type = "TrueHD".to_string();
+    s6.is_native_atmos = true;
+    let (fmt6, ch6, _) = format_track_audio_summary(&s6, std::path::Path::new("atmos.mkv"), None);
+    assert_eq!(fmt6, "TrueHD/MKV");
+    assert_eq!(ch6, "Dolby Atmos (7.1.4)");
+
+    let mut s7 = AppState::new("stereo.flac".to_string());
+    s7.module_type = "FLAC".to_string();
+    s7.source_channels = 2;
+    s7.hardware_channels = 12;
+    s7.stats.mpegh_bitstream_active = true;
+    let (_, ch7, _) = format_track_audio_summary(&s7, std::path::Path::new("stereo.flac"), None);
+    assert_eq!(ch7, "Stereo (2ch) -> 7.1.4 MPEG-H Upmix (12ch)");
 }
 
 #[test]
 fn test_artist_unknown_omission() {
-    let should_display_artist = |artist: &str| -> bool {
-        let trimmed = artist.trim();
-        !trimmed.is_empty()
-            && !trimmed.eq_ignore_ascii_case("unknown")
-            && !trimmed.eq_ignore_ascii_case("unknown artist")
-    };
+    use super::ui_overlay::should_display_artist;
 
     assert!(!should_display_artist(""));
     assert!(!should_display_artist("   "));
@@ -921,57 +934,62 @@ fn test_windows_installer_icon_registration() {
 fn test_bitstream_state_reset_on_stream_change() {
     let mut state = crate::state::AppState::new("Test App".to_string());
 
-    // Simulate bitstream playback active
+    // Simulate bitstream & video playback active with pending latches and scrub state
+    state.has_video_stream = true;
+    state.video_info = Some("H264 (1920x1080)".to_string());
+    state.video_mode = 2;
+    state.is_paused = true;
+    state.seek_request = Some(45.0);
+    state.scrub_target_seconds = Some(48.0);
+    state.is_touch_scrubbing = true;
+    state.audio_device_lost = true;
+    state.rt_control.signal_audio_device_lost();
+    state.track_ended = true;
+    state.rt_control.signal_track_ended();
     state.stats.bitstream_active = true;
+    state.stats.mpegh_bitstream_active = true;
+    state.stats.mpegh_carrier_info = "PipeWire MPEG-H".to_string();
     state.stats.audio_buffer_fill_pct = 78.5;
     state.stats.video_buffer_fill_pct = 62.0;
+    state.stats.video_decode_us = 410.0;
+    state.stats.video_hw_decoder = "HW (VAAPI)".to_string();
     state.stats.video_fps = 59.94;
     state.stats.video_bitrate_kbps = Some(15000);
     state.stats.audio_bitrate_kbps = Some(768);
-    state.track_ended = false;
-    assert!(state.stats.bitstream_active);
-    assert_eq!(state.stats.audio_buffer_fill_pct, 78.5);
-    assert_eq!(state.stats.video_fps, 59.94);
-    assert_eq!(state.stats.video_bitrate_kbps, Some(15000));
-    assert_eq!(state.stats.audio_bitrate_kbps, Some(768));
+    state.sync_rt_control();
 
-    // Simulate stream drop / transition logic from main.rs
-    state.video_frame_rx = None;
-    state.free_video_frame_tx = None;
-    state.video_mode = 0;
-    state.stats.bitstream_active = false;
-    state.stats.audio_buffer_fill_pct = 0.0;
-    state.stats.video_buffer_fill_pct = 0.0;
-    state.stats.video_hw_decoder.clear();
-    state.stats.video_fps = 0.0;
-    state.stats.video_bitrate_kbps = None;
-    state.stats.audio_bitrate_kbps = None;
-    state.track_ended = false;
+    // Preserving pause/seek (device topology reload) keeps pause & seek_request, clears stream telemetry
+    state.reset_stream_transition_state(true);
+    assert!(!state.has_video_stream);
+    assert!(state.video_info.is_none());
+    assert_eq!(state.video_mode, 0);
+    assert!(!state.stats.bitstream_active);
+    assert!(!state.stats.mpegh_bitstream_active);
+    assert!(state.stats.mpegh_carrier_info.is_empty());
+    assert_eq!(state.stats.audio_buffer_fill_pct, 0.0);
+    assert_eq!(state.stats.video_buffer_fill_pct, 0.0);
+    assert_eq!(state.stats.video_decode_us, 0.0);
+    assert!(state.stats.video_hw_decoder.is_empty());
+    assert_eq!(state.stats.video_fps, 0.0);
+    assert_eq!(state.stats.video_bitrate_kbps, None);
+    assert_eq!(state.stats.audio_bitrate_kbps, None);
+    assert!(!state.audio_device_lost);
+    assert!(!state.rt_control.take_audio_device_lost());
+    assert!(!state.track_ended);
+    assert!(!state.rt_control.take_track_ended());
+    assert!(state.is_paused);
+    assert_eq!(state.seek_request, Some(45.0));
+    assert!(state.rt_control.is_paused());
 
-    assert!(
-        !state.stats.bitstream_active,
-        "bitstream_active must be false after dropping stream"
-    );
-    assert_eq!(
-        state.stats.audio_buffer_fill_pct, 0.0,
-        "audio_buffer_fill_pct must be 0 after dropping stream"
-    );
-    assert_eq!(
-        state.stats.video_buffer_fill_pct, 0.0,
-        "video_buffer_fill_pct must be 0 after dropping stream"
-    );
-    assert_eq!(
-        state.stats.video_fps, 0.0,
-        "video_fps must be 0 after dropping stream"
-    );
-    assert!(
-        state.stats.video_bitrate_kbps.is_none(),
-        "video_bitrate_kbps must be None after dropping stream"
-    );
-    assert!(
-        state.stats.audio_bitrate_kbps.is_none(),
-        "audio_bitrate_kbps must be None after dropping stream"
-    );
+    // Full track switch (`preserve_pause_and_seek = false`) also clears pause, seek, and scrub state
+    state.stats.bitstream_active = true;
+    state.reset_stream_transition_state(false);
+    assert!(!state.stats.bitstream_active);
+    assert!(!state.is_paused);
+    assert!(!state.rt_control.is_paused());
+    assert_eq!(state.seek_request, None);
+    assert_eq!(state.scrub_target_seconds, None);
+    assert!(!state.is_touch_scrubbing);
 }
 
 #[test]
@@ -1011,10 +1029,12 @@ fn test_push_planar_lookahead_slices_timestamps() {
 
 #[test]
 fn test_lookahead_timeline_continuity_and_synthesis() {
+    use crate::state::update_lookahead_timeline_from_queue;
+
     let mut state = crate::state::AppState::new("Test App".to_string());
     state.lookahead_timeline = vec![0.0; 600 * 8];
 
-    // Part 1: Full 7-second decoded lookahead buffer (normal playback)
+    // Part 1: Full 7-second decoded lookahead buffer via real production update_lookahead_timeline_from_queue
     for i in 0..700 {
         let t = 5.0 + (i as f64 * 0.01);
         let s = (i as f32 * 0.05).sin() * 0.4;
@@ -1024,55 +1044,15 @@ fn test_lookahead_timeline_continuity_and_synthesis() {
         ));
     }
 
-    let cur_t = 6.0;
-    let q_len = state.lookahead_queue.len();
-    let (t_first, d_first) = state.lookahead_queue[0];
-    let (t_last, d_last) = state.lookahead_queue[q_len - 1];
+    update_lookahead_timeline_from_queue(
+        &state.lookahead_queue,
+        &state.raw_waveform,
+        &state.raw_channel_vus,
+        6.0,
+        &mut state.lookahead_timeline,
+    );
 
-    for k in 0..600 {
-        let target_t = cur_t + (k as f64 - 100.0) * 0.01;
-        let off = k * 8;
-
-        if target_t < t_first {
-            let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
-            for (c, val) in d_first.iter().enumerate() {
-                state.lookahead_timeline[off + c] = *val * fade;
-            }
-        } else if target_t > t_last {
-            let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
-            for (c, val) in d_last.iter().enumerate() {
-                state.lookahead_timeline[off + c] = *val * fade;
-            }
-        } else {
-            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| {
-                t.partial_cmp(&target_t)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
-                Ok(i) => i,
-                Err(i) => i,
-            };
-
-            if idx == 0 {
-                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
-            } else if idx >= q_len {
-                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
-            } else {
-                let (t0, d0) = state.lookahead_queue[idx - 1];
-                let (t1, d1) = state.lookahead_queue[idx];
-                let dt = t1 - t0;
-                if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
-                    let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
-                    for c in 0..8 {
-                        state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
-                    }
-                } else {
-                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
-                }
-            }
-        }
-    }
-
-    // Verify that lookahead is continuous with NO step discontinuities / banding across adjacent slices
+    // Verify that lookahead is continuous with NO step discontinuities across adjacent slices
     for k in 0..599 {
         let off0 = k * 8;
         let off1 = (k + 1) * 8;
@@ -1088,43 +1068,29 @@ fn test_lookahead_timeline_continuity_and_synthesis() {
         );
     }
 
-    // Part 2: Fallback synthesis when queue is empty
+    // Verify leading 0.5s fade-in when cur_t places early slices before t_first (5.0s)
+    update_lookahead_timeline_from_queue(
+        &state.lookahead_queue,
+        &state.raw_waveform,
+        &state.raw_channel_vus,
+        5.1,
+        &mut state.lookahead_timeline,
+    );
+    // k=0 -> target_t = 4.1 (< 4.5 -> faded to 0.0); k=100 -> target_t = 5.1 (active)
+    assert_eq!(state.lookahead_timeline[1], 0.0);
+    assert!(state.lookahead_timeline[100 * 8 + 1] > 0.05);
+
+    // Part 2: Fallback synthesis when queue is empty but raw_waveform is populated
     state.lookahead_queue.clear();
     state.raw_waveform = vec![0.5; 512];
     state.raw_channel_vus = vec![0.7, 0.7];
-
-    let wave_len = state.raw_waveform.len();
-    let vu_l = state
-        .raw_channel_vus
-        .first()
-        .copied()
-        .unwrap_or(0.2)
-        .clamp(0.05, 1.0);
-    let vu_r = state
-        .raw_channel_vus
-        .get(1)
-        .copied()
-        .unwrap_or(vu_l)
-        .clamp(0.05, 1.0);
-    for k in 0..600 {
-        let off = k * 8;
-        let wave_idx = (k * 13) % wave_len;
-        let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
-        let sample_next = state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
-        let min_s = sample.min(sample_next).min(0.0) * vu_l;
-        let max_s = sample.max(sample_next).max(0.0) * vu_l;
-        let min_r = sample.min(sample_next).min(0.0) * vu_r;
-        let max_r = sample.max(sample_next).max(0.0) * vu_r;
-        let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
-        state.lookahead_timeline[off] = min_s;
-        state.lookahead_timeline[off + 1] = max_s;
-        state.lookahead_timeline[off + 2] = min_r;
-        state.lookahead_timeline[off + 3] = max_r;
-        state.lookahead_timeline[off + 4] = rms;
-        state.lookahead_timeline[off + 5] = rms;
-        state.lookahead_timeline[off + 6] = vu_l;
-        state.lookahead_timeline[off + 7] = vu_r;
-    }
+    update_lookahead_timeline_from_queue(
+        &state.lookahead_queue,
+        &state.raw_waveform,
+        &state.raw_channel_vus,
+        6.0,
+        &mut state.lookahead_timeline,
+    );
 
     for k in 0..600 {
         let off = k * 8;
@@ -1133,6 +1099,17 @@ fn test_lookahead_timeline_continuity_and_synthesis() {
         assert!(max_s > 0.0, "Fallback slice {} max_s should be positive", k);
         assert!(rms > 0.0, "Fallback slice {} rms should be non-zero", k);
     }
+
+    // Part 3: Empty queue + empty waveform zeroes the timeline
+    state.raw_waveform.clear();
+    update_lookahead_timeline_from_queue(
+        &state.lookahead_queue,
+        &state.raw_waveform,
+        &state.raw_channel_vus,
+        6.0,
+        &mut state.lookahead_timeline,
+    );
+    assert!(state.lookahead_timeline.iter().all(|&v| v == 0.0));
 }
 
 #[test]
@@ -3484,5 +3461,46 @@ fn test_flip_disc_registration_sim_and_shaders() {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name} validation error: {e:?}"));
+    }
+}
+
+#[test]
+fn test_procedural_mesh_generators_bounds_and_finiteness() {
+    use super::meshes::{generate_lamp_mesh, generate_synthwave_racer_mesh};
+
+    let assert_valid_mesh = |label: &str, verts: &[Vertex], inds: &[u32]| {
+        assert!(!verts.is_empty(), "{label} vertices must not be empty");
+        assert!(!inds.is_empty(), "{label} indices must not be empty");
+        assert_eq!(inds.len() % 3, 0, "{label} indices must form triangles");
+        for &idx in inds {
+            assert!(
+                (idx as usize) < verts.len(),
+                "{label} index {idx} out of bounds (verts={})",
+                verts.len()
+            );
+        }
+        for (i, v) in verts.iter().enumerate() {
+            assert!(
+                v.position.iter().all(|c| c.is_finite())
+                    && v.normal.iter().all(|c| c.is_finite())
+                    && v.tex_coords.iter().all(|c| c.is_finite()),
+                "{label} vertex {i} has non-finite attribute: {v:?}"
+            );
+        }
+    };
+
+    let (lamp_v, lamp_i) = generate_lamp_mesh();
+    assert_valid_mesh("lamp_mesh", &lamp_v, &lamp_i);
+
+    let (racer_v, racer_i) = generate_synthwave_racer_mesh();
+    assert_valid_mesh("synthwave_racer_mesh", &racer_v, &racer_i);
+
+    for (label, text) in [
+        ("lyrics_empty", ""),
+        ("lyrics_ascii", "Hello World 123!"),
+        ("lyrics_non_ascii", "音楽 ♪ 日本語"),
+    ] {
+        let (lv, li) = generate_glass_lyrics_mesh(text);
+        assert_valid_mesh(label, &lv, &li);
     }
 }

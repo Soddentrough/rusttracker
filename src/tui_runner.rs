@@ -706,33 +706,10 @@ where
                 let _ = active_stream.take(); // DROP OLD STREAM FIRST
                 {
                     let mut state = app_state.lock().unwrap();
-                    state.video_frame_rx = None;
-                    state.free_video_frame_tx = None;
-                    state.has_video_stream = false;
-                    state.video_info = None;
-                    state.video_mode = 0;
-                    state.stats.bitstream_active = false;
-                    state.stats.mpegh_bitstream_active = false;
-                    state.stats.mpegh_carrier_info.clear();
-                    state.stats.audio_buffer_fill_pct = 0.0;
-                    state.stats.video_buffer_fill_pct = 0.0;
-                    state.stats.video_decode_us = 0.0;
-                    state.stats.video_hw_decoder.clear();
-                    state.stats.video_fps = 0.0;
-                    state.stats.video_bitrate_kbps = None;
-                    state.stats.audio_bitrate_kbps = None;
-                    state.audio_device_lost = false;
-                    let _ = state.rt_control.take_audio_device_lost();
-                    state.track_ended = false;
-                    let _ = state.rt_control.take_track_ended();
-                    if resume_pos_on_reload.is_none() {
-                        state.is_paused = false;
-                        state.seek_request = None;
-                    }
                     if !state.show_surround_eq {
                         state.tui_center_view = None;
                     }
-                    state.sync_rt_control();
+                    state.reset_stream_transition_state(resume_pos_on_reload.is_some());
                 }
 
                 let mut loaded_stream = None;

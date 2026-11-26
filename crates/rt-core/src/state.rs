@@ -2435,6 +2435,38 @@ impl AppState {
         self.scrub_target_seconds = None;
     }
 
+    /// Resets transient stream, video, and bitstream telemetry before loading a new stream.
+    /// When `preserve_pause_and_seek` is true (e.g., mid-track device reload), pause and
+    /// pending seek/scrub state are kept intact.
+    pub fn reset_stream_transition_state(&mut self, preserve_pause_and_seek: bool) {
+        self.video_frame_rx = None;
+        self.free_video_frame_tx = None;
+        self.has_video_stream = false;
+        self.video_info = None;
+        self.video_mode = 0;
+        self.stats.bitstream_active = false;
+        self.stats.mpegh_bitstream_active = false;
+        self.stats.mpegh_carrier_info.clear();
+        self.stats.audio_buffer_fill_pct = 0.0;
+        self.stats.video_buffer_fill_pct = 0.0;
+        self.stats.video_decode_us = 0.0;
+        self.stats.video_hw_decoder.clear();
+        self.stats.video_fps = 0.0;
+        self.stats.video_bitrate_kbps = None;
+        self.stats.audio_bitrate_kbps = None;
+        self.audio_device_lost = false;
+        let _ = self.rt_control.take_audio_device_lost();
+        self.track_ended = false;
+        let _ = self.rt_control.take_track_ended();
+        if !preserve_pause_and_seek {
+            self.is_paused = false;
+            self.seek_request = None;
+            self.scrub_target_seconds = None;
+            self.is_touch_scrubbing = false;
+        }
+        self.sync_rt_control();
+    }
+
     /// Enables or disables 12-channel 7.1.4 (11.1, CICP Layout 19) MPEG-H 3D Audio IEC 61937-13
     /// HDMI bitstreaming for surround upmixing and native >8ch playback on HDMI AVRs.
     pub fn set_mpegh_bitstream(&mut self, enabled: bool) {
@@ -3013,23 +3045,28 @@ mod tests {
             !state.rt_control.need_gpu_spectrum(),
             "Spectrum visualizer (id 0) does not need per-channel GPU FFTs"
         );
-        if let Some(fire_idx) = VISUALIZERS.iter().position(|v| v.id == 6) {
-            state.current_visualizer_idx = fire_idx;
-            state.sync_rt_control();
-            assert!(
-                state.rt_control.need_gpu_spectrum(),
-                "Firesim visualizer (id 6) requires per-channel GPU FFTs"
-            );
-            assert!(!state.rt_control.need_multichannel_raw());
-        }
-        if let Some(studio_idx) = VISUALIZERS.iter().position(|v| v.id == 31) {
-            state.current_visualizer_idx = studio_idx;
-            state.sync_rt_control();
-            assert!(
-                !state.rt_control.need_gpu_spectrum() && state.rt_control.need_multichannel_raw(),
-                "Neon Acoustic Studio (id 31) needs raw multi-channel audio without multi-channel FFTs"
-            );
-        }
+        let fire_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.id == 6)
+            .expect("Firesim visualizer (id 6) must be registered");
+        state.current_visualizer_idx = fire_idx;
+        state.sync_rt_control();
+        assert!(
+            state.rt_control.need_gpu_spectrum(),
+            "Firesim visualizer (id 6) requires per-channel GPU FFTs"
+        );
+        assert!(!state.rt_control.need_multichannel_raw());
+
+        let studio_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.id == 31)
+            .expect("Neon Acoustic Studio (id 31) must be registered");
+        state.current_visualizer_idx = studio_idx;
+        state.sync_rt_control();
+        assert!(
+            !state.rt_control.need_gpu_spectrum() && state.rt_control.need_multichannel_raw(),
+            "Neon Acoustic Studio (id 31) needs raw multi-channel audio without multi-channel FFTs"
+        );
 
         let mut dst = AppState::new(String::new());
         state.render_snapshot_into(&mut dst);
@@ -3055,5 +3092,81 @@ mod tests {
         assert_eq!(dst.spectrum_data.capacity(), spec_cap);
         assert_eq!(dst.channel_vus[0], 0.9);
         assert_eq!(dst.spectrum_data[10], 55.0);
+    }
+
+    #[test]
+    fn test_format_timeline_time_edge_cases() {
+        assert_eq!(format_timeline_time(-5.0, false), "00:00");
+        assert_eq!(format_timeline_time(f64::NAN, false), "00:00");
+        assert_eq!(format_timeline_time(f64::INFINITY, false), "00:00");
+        assert_eq!(format_timeline_time(0.0, true), "0:00:00");
+        assert_eq!(format_timeline_time(3661.9, false), "1:01:01");
+    }
+
+    #[test]
+    fn test_update_lookahead_timeline_edges_gaps_and_empty_zeroing() {
+        let mut timeline = vec![42.0f32; 600 * 8];
+        let empty_q = std::collections::VecDeque::new();
+        update_lookahead_timeline_from_queue(&empty_q, &[], &[], 5.0, &mut timeline);
+        assert!(
+            timeline.iter().all(|&v| v == 0.0),
+            "Empty queue and empty waveform must zero timeline"
+        );
+
+        // Single-element queue at t=10.0 checks leading fade-in (< t_first), exact hit, and trailing fade-out (> t_last)
+        let mut single_q = std::collections::VecDeque::new();
+        single_q.push_back((10.0, [-0.5, 0.8, -0.5, 0.8, 0.4, 0.4, 0.6, 0.6]));
+        // cur_t = 9.0 -> slice k=0 is target_t=8.0 (0.0 fade), k=100 is target_t=9.0 (0.0), k=200 is target_t=10.0 (full), k=225 is target_t=10.25 (0.5 fade)
+        update_lookahead_timeline_from_queue(&single_q, &[], &[], 9.0, &mut timeline);
+        assert_eq!(timeline[100 * 8 + 1], 0.0);
+        assert!((timeline[175 * 8 + 1] - 0.8 * 0.5).abs() < 1e-4);
+        assert!((timeline[200 * 8 + 1] - 0.8).abs() < 1e-4);
+        assert!((timeline[225 * 8 + 1] - 0.8 * 0.5).abs() < 1e-4);
+
+        // Large gap (dt >= 1.0s) holds d0 instead of interpolating across silence
+        let mut gap_q = std::collections::VecDeque::new();
+        gap_q.push_back((10.0, [-0.2, 0.2, -0.2, 0.2, 0.2, 0.2, 0.2, 0.2]));
+        gap_q.push_back((12.0, [-0.8, 0.8, -0.8, 0.8, 0.8, 0.8, 0.8, 0.8]));
+        // k=200 at cur_t=9.0 -> target_t=10.0, k=300 -> target_t=11.0 (inside 2s gap)
+        update_lookahead_timeline_from_queue(&gap_q, &[], &[], 9.0, &mut timeline);
+        assert!((timeline[300 * 8 + 1] - 0.2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_visualizer_perf_guard_transient_stutter_and_paused_ignore() {
+        let heavy_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.heavy_shader)
+            .expect("At least one heavy_shader visualizer must exist");
+
+        let mut state = AppState::new("Guard.flac".to_string());
+        state.vis_enabled[heavy_idx] = true;
+        state.auto_vis_guard = true;
+        state.file_loaded = true;
+        state.current_visualizer_idx = heavy_idx;
+        state.visualizer_mode = VISUALIZERS[heavy_idx].id;
+
+        // Paused state ignores slow frames
+        state.is_paused = true;
+        for _ in 0..200 {
+            state.update_visualizer_perf_guard(0.1, 60.0);
+        }
+        assert!(state.vis_enabled[heavy_idx]);
+
+        // Unpaused transient stutter (60 slow frames < 90 threshold) followed by fast frames resets counter
+        state.is_paused = false;
+        for _ in 0..60 {
+            state.update_visualizer_perf_guard(1.0 / 25.0, 60.0);
+        }
+        for _ in 0..10 {
+            state.update_visualizer_perf_guard(1.0 / 60.0, 60.0);
+        }
+        for _ in 0..60 {
+            state.update_visualizer_perf_guard(1.0 / 25.0, 60.0);
+        }
+        assert!(
+            state.vis_enabled[heavy_idx],
+            "Fast frames between transient stutters must reset slow-frame counter"
+        );
     }
 }

@@ -123,3 +123,72 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     }
     names
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_relevant_audio_device_filters_virtual_and_preserves_hardware() {
+        for rejected in [
+            "null",
+            "NULL",
+            "dmix:CARD=PCH,DEV=0",
+            "dsnoop:CARD=PCH",
+            "adsp_virtual",
+            "speex",
+            "speexrate",
+            "upmix_6ch",
+            "vdownmix",
+            "samplerate",
+            "lavrate",
+            "Sonic Studio Virtual Mixer",
+        ] {
+            assert!(
+                !is_relevant_audio_device(rejected),
+                "Expected virtual/helper device '{rejected}' to be filtered out"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        for surround in ["surround40", "surround51", "surround71"] {
+            assert!(
+                !is_relevant_audio_device(surround),
+                "Expected Linux ALSA alias '{surround}' to be filtered out"
+            );
+        }
+
+        for accepted in [
+            "PipeWire Sound Server",
+            "HDMI / DisplayPort 2 - Navi 31",
+            "USB Audio DAC (UAC2)",
+            "Speakers (Realtek Audio)",
+        ] {
+            assert!(
+                is_relevant_audio_device(accepted),
+                "Expected hardware/server endpoint '{accepted}' to remain relevant"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_default_audio_device_selection_variants() {
+        assert!(is_default_audio_device_selection(None));
+        assert!(is_default_audio_device_selection(Some("")));
+        assert!(is_default_audio_device_selection(Some("   ")));
+        assert!(is_default_audio_device_selection(Some(
+            SYSTEM_DEFAULT_AUDIO_DEVICE
+        )));
+        assert!(is_default_audio_device_selection(Some("DEFAULT")));
+        assert!(is_default_audio_device_selection(Some("Default Device")));
+        assert!(is_default_audio_device_selection(Some(
+            "Default ALSA Output (currently PipeWire Media Server)"
+        )));
+        assert!(is_default_audio_device_selection(Some(
+            "default alsa input (Loopback)"
+        )));
+
+        assert!(!is_default_audio_device_selection(Some("HDMI 0")));
+        assert!(!is_default_audio_device_selection(Some("RME Babyface Pro")));
+    }
+}

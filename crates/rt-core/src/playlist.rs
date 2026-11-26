@@ -260,6 +260,35 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct TempTestDir(PathBuf);
+
+    impl TempTestDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rt_playlist_test_{}_{}_{}",
+                tag,
+                std::process::id(),
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn test_is_supported_media_extension() {
@@ -281,9 +310,8 @@ mod tests {
 
     #[test]
     fn test_parse_m3u() {
-        let temp_dir = std::env::temp_dir().join("rusttracker_test_m3u");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let m3u_path = temp_dir.join("test.m3u");
+        let temp_dir = TempTestDir::new("m3u");
+        let m3u_path = temp_dir.path().join("test.m3u");
 
         let content = "#EXTM3U\n#EXTINF:123,Test Song\ntrack1.mp3\n# Comment\n/abs/path/track2.flac\nhttp://example.com/stream\n";
         let mut file = File::create(&m3u_path).unwrap();
@@ -294,15 +322,12 @@ mod tests {
         assert!(parsed[0].ends_with("track1.mp3"));
         assert_eq!(parsed[1], "/abs/path/track2.flac");
         assert_eq!(parsed[2], "http://example.com/stream");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_parse_pls() {
-        let temp_dir = std::env::temp_dir().join("rusttracker_test_pls");
-        let _ = std::fs::create_dir_all(&temp_dir);
-        let pls_path = temp_dir.join("test.pls");
+        let temp_dir = TempTestDir::new("pls");
+        let pls_path = temp_dir.path().join("test.pls");
 
         let content = "[playlist]\nNumberOfEntries=2\nFile1=song1.mod\nTitle1=Song 1\nFile2=https://example.com/live\nTitle2=Live\n";
         let mut file = File::create(&pls_path).unwrap();
@@ -312,33 +337,26 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].ends_with("song1.mod"));
         assert_eq!(parsed[1], "https://example.com/live");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
     fn test_scan_directory_symlink_cycle_and_depth_limit() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "rusttracker_test_scan_bounds_{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = TempTestDir::new("scan_bounds");
 
-        let root_track = temp_dir.join("root.flac");
+        let root_track = temp_dir.path().join("root.flac");
         File::create(&root_track).unwrap();
 
         #[cfg(unix)]
         {
-            let sub = temp_dir.join("sub");
+            let sub = temp_dir.path().join("sub");
             std::fs::create_dir_all(&sub).unwrap();
             File::create(sub.join("nested.mp3")).unwrap();
             // Create a self/parent symlink cycle: temp_dir/sub/cycle -> temp_dir
-            std::os::unix::fs::symlink(&temp_dir, sub.join("cycle")).unwrap();
+            std::os::unix::fs::symlink(temp_dir.path(), sub.join("cycle")).unwrap();
         }
 
         // Create a chain deeper than MAX_DIRECTORY_SCAN_DEPTH (32)
-        let mut cur = temp_dir.clone();
+        let mut cur = temp_dir.path().to_path_buf();
         for depth in 0..=36 {
             cur = cur.join(format!("d{}", depth));
             std::fs::create_dir_all(&cur).unwrap();
@@ -349,7 +367,7 @@ mod tests {
             }
         }
 
-        let found = scan_directory(&temp_dir);
+        let found = scan_directory(temp_dir.path());
         assert!(found.iter().any(|p| p.ends_with("root.flac")));
         #[cfg(unix)]
         assert_eq!(
@@ -361,7 +379,139 @@ mod tests {
             !found.iter().any(|p| p.ends_with("beyond_limit.ogg")),
             "Files beyond MAX_DIRECTORY_SCAN_DEPTH should not be scanned"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+    #[test]
+    fn test_playlist_bom_and_pls_edge_cases() {
+        let temp_dir = TempTestDir::new("bom_edges");
+
+        let m3u8_path = temp_dir.path().join("utf8.m3u8");
+        let m3u8_content = "\u{feff}#EXTM3U\n\n  # indented comment\nfile:///C:/Music/song.flac\nmic://default\nhttp://radio.example/live\n/abs/unix/track.wav\nrel/sub.mp3\n";
+        std::fs::write(&m3u8_path, m3u8_content.as_bytes()).unwrap();
+        let m3u8 = parse_playlist_file(&m3u8_path).unwrap();
+        assert_eq!(m3u8.len(), 5);
+        assert_eq!(m3u8[0], "file:///C:/Music/song.flac");
+        assert_eq!(m3u8[1], "mic://default");
+        assert_eq!(m3u8[2], "http://radio.example/live");
+        assert_eq!(m3u8[3], "/abs/unix/track.wav");
+        assert_eq!(
+            m3u8[4],
+            temp_dir.path().join("rel/sub.mp3").to_string_lossy()
+        );
+
+        let pls_path = temp_dir.path().join("mixed.pls");
+        let pls_content = "\u{feff}[playlist]\nFILE1=first.ogg\nFileFoo=should_be_ignored.mp3\nfile2=  \nfile3=/direct/path.opus\n";
+        std::fs::write(&pls_path, pls_content.as_bytes()).unwrap();
+        let pls = parse_playlist_file(&pls_path).unwrap();
+        assert_eq!(pls.len(), 2);
+        assert_eq!(pls[0], temp_dir.path().join("first.ogg").to_string_lossy());
+        assert_eq!(pls[1], "/direct/path.opus");
+    }
+
+    #[test]
+    fn test_dvd_menu_and_continuation_vob_filtering() {
+        let temp_dir = TempTestDir::new("dvd_vob_filter");
+
+        let dvd_dir = temp_dir.path().join("with_part1");
+        std::fs::create_dir_all(&dvd_dir).unwrap();
+        for name in [
+            "VIDEO_TS.VOB",
+            "AUDIO_TS.VOB",
+            "VTS_01_0.VOB",
+            "VTS_01_1.VOB",
+            "VTS_01_2.VOB",
+        ] {
+            File::create(dvd_dir.join(name)).unwrap();
+        }
+        let found_dvd = scan_directory(&dvd_dir);
+        assert_eq!(
+            found_dvd,
+            vec![dvd_dir.join("VTS_01_1.VOB").to_string_lossy().into_owned()]
+        );
+
+        let standalone_dir = temp_dir.path().join("standalone_part2");
+        std::fs::create_dir_all(&standalone_dir).unwrap();
+        File::create(standalone_dir.join("VTS_01_2.VOB")).unwrap();
+        let found_standalone = scan_directory(&standalone_dir);
+        assert_eq!(
+            found_standalone,
+            vec![
+                standalone_dir
+                    .join("VTS_01_2.VOB")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_expand_input_paths_nesting_cycles_and_urls() {
+        let temp_dir = TempTestDir::new("expand_paths");
+
+        let folder = temp_dir.path().join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder_track = folder.join("alpha.flac");
+        File::create(&folder_track).unwrap();
+
+        let pls_path = temp_dir.path().join("inner.pls");
+        std::fs::write(&pls_path, "[playlist]\nFile1=nested.mod\n").unwrap();
+
+        let outer_m3u = temp_dir.path().join("outer.m3u");
+        std::fs::write(
+            &outer_m3u,
+            format!("{}\nhttps://stream.example/live\n", pls_path.display()),
+        )
+        .unwrap();
+
+        // Mutually recursive playlists a.m3u <-> b.m3u must terminate without error/looping
+        let a_m3u = temp_dir.path().join("a.m3u");
+        let b_m3u = temp_dir.path().join("b.m3u");
+        std::fs::write(&a_m3u, "b.m3u\ncycle_track.mp3\n").unwrap();
+        std::fs::write(&b_m3u, "a.m3u\n").unwrap();
+
+        // Depth limit (> MAX_PLAYLIST_NEST_DEPTH = 4) leaves deepest playlist path unexpanded
+        let mut chain = Vec::new();
+        for i in 0..=5 {
+            chain.push(temp_dir.path().join(format!("nest_{i}.m3u")));
+        }
+        for i in 0..5 {
+            std::fs::write(&chain[i], format!("{}\n", chain[i + 1].display())).unwrap();
+        }
+        std::fs::write(&chain[5], "deep_song.wav\n").unwrap();
+
+        let expanded = expand_input_paths(&[
+            String::new(),
+            "mic://default".to_string(),
+            folder.to_string_lossy().into_owned(),
+            outer_m3u.to_string_lossy().into_owned(),
+            a_m3u.to_string_lossy().into_owned(),
+            chain[0].to_string_lossy().into_owned(),
+        ]);
+
+        assert!(expanded.contains(&"mic://default".to_string()));
+        assert!(expanded.contains(&folder_track.to_string_lossy().into_owned()));
+        assert!(
+            expanded.contains(
+                &temp_dir
+                    .path()
+                    .join("nested.mod")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(expanded.contains(&"https://stream.example/live".to_string()));
+        assert!(
+            expanded.contains(
+                &temp_dir
+                    .path()
+                    .join("cycle_track.mp3")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(
+            expanded.contains(&chain[4].to_string_lossy().into_owned()),
+            "Expected nesting beyond MAX_PLAYLIST_NEST_DEPTH to stop expanding cleanly: {expanded:?}"
+        );
     }
 }

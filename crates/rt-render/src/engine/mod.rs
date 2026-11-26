@@ -3511,15 +3511,23 @@ impl VulkanEngine {
         self.video_state.is_some()
     }
 
+    /// Advances the EMA-smoothed frame delta and modular host clock `smooth_time`,
+    /// returning the clamped frame delta for animation integrators.
+    pub(crate) fn step_smooth_frame_time(
+        smooth_dt: &mut f64,
+        smooth_time: &mut f64,
+        dt: f32,
+    ) -> f32 {
+        let alpha = 0.03f64;
+        *smooth_dt = *smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
+        *smooth_time = (*smooth_time + *smooth_dt).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS);
+        (*smooth_dt as f32).clamp(0.0005, 0.1)
+    }
+
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
 
-        // Exponential moving average to smooth CPU/GPU scheduling time jitter
-        let alpha = 0.03f64;
-        self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
-        self.smooth_time =
-            (self.smooth_time + self.smooth_dt).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS);
-        let frame_dt = (self.smooth_dt as f32).clamp(0.0005, 0.1);
+        let frame_dt = Self::step_smooth_frame_time(&mut self.smooth_dt, &mut self.smooth_time, dt);
 
         if !state.file_loaded {
             self.smooth_audio_seconds = 0.0;

@@ -228,10 +228,14 @@ fn strip_inline_tags(text: &str) -> String {
                 }
                 tag.push(inner);
             }
-            // If it wasn't closed or not a valid inline tag, keep original
+            // If it wasn't closed or not a valid inline timestamp tag, keep original
             if !closed {
                 result.push('<');
                 result.push_str(&tag);
+            } else if parse_time_tag(tag.trim()).is_none() {
+                result.push('<');
+                result.push_str(&tag);
+                result.push('>');
             }
         } else {
             result.push(ch);
@@ -555,18 +559,44 @@ mod tests {
         assert!((lyrics.lines[3].time_seconds - 3723.45).abs() < 1e-3);
     }
 
+    struct TempTestDir(PathBuf);
+
+    impl TempTestDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "rt_lyrics_test_{}_{}_{}",
+                tag,
+                std::process::id(),
+                id
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn test_karaoke_directory_sidecar_loading_and_stem_boundaries() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("rusttracker_test_lrc_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        let _ = fs::create_dir_all(&temp_dir);
+        let temp_dir = TempTestDir::new("sidecar");
 
         // 1. Legitimate delimiter-bounded prefix match ("Test Artist - Test Song (Live).flac" -> "Test Artist - Test Song.lrc")
-        let flac_path = temp_dir.join("Test Artist - Test Song (Live).flac");
-        let lrc_path = temp_dir.join("Test Artist - Test Song.lrc");
-        let _ = fs::write(&flac_path, b"dummy audio content");
-        let _ = fs::write(&lrc_path, "[00:10.00] Test line\n[00:20.00] Second line\n");
+        let flac_path = temp_dir.path().join("Test Artist - Test Song (Live).flac");
+        let lrc_path = temp_dir.path().join("Test Artist - Test Song.lrc");
+        fs::write(&flac_path, b"dummy audio content").unwrap();
+        fs::write(&lrc_path, "[00:10.00] Test line\n[00:20.00] Second line\n").unwrap();
 
         let lyrics = load_lyrics_for_file(&flac_path.to_string_lossy())
             .expect("Should load delimiter-bounded sidecar lyrics");
@@ -574,16 +604,83 @@ mod tests {
         assert_eq!(lyrics.lines[0].text, "Test line");
 
         // 2. Partial numeric/word prefix must NOT match ("Track 1.lrc" must NOT match "Track 10.flac")
-        let track1_lrc = temp_dir.join("Track 1.lrc");
-        let track10_flac = temp_dir.join("Track 10.flac");
-        let _ = fs::write(&track1_lrc, "[00:05.00] Wrong track\n");
-        let _ = fs::write(&track10_flac, b"dummy audio content");
+        let track1_lrc = temp_dir.path().join("Track 1.lrc");
+        let track10_flac = temp_dir.path().join("Track 10.flac");
+        fs::write(&track1_lrc, "[00:05.00] Wrong track\n").unwrap();
+        fs::write(&track10_flac, b"dummy audio content").unwrap();
         assert!(
             find_sidecar_lrc_path(&track10_flac.to_string_lossy()).is_none(),
             "Track 1.lrc must not match Track 10.flac"
         );
+    }
 
-        let _ = fs::remove_dir_all(&temp_dir);
+    #[test]
+    fn test_strip_inline_tags_preserves_non_timestamps_and_strips_enhanced_lrc() {
+        let lrc = Lyrics::parse("[00:01.00]<00:01.00>I <00:01.50>love <3 & <chorus> <unclosed\n")
+            .expect("Should parse enhanced LRC with literal angle brackets");
+        assert_eq!(lrc.lines.len(), 1);
+        assert_eq!(lrc.lines[0].text, "I love <3 & <chorus> <unclosed");
+    }
+
+    #[test]
+    fn test_parse_edge_cases_bom_unsorted_duplicates_metadata_and_offset() {
+        assert!(Lyrics::parse("[ti:Only Title]\n[ar:Artist Only]\n# comment\n").is_none());
+
+        let lrc = Lyrics::parse(
+            "\u{feff}[ti:Song Title]\n[ar:Artist]\n[al:Album]\n[offset:5000]\n[00:20.00][00:02.00]Chorus\n[00:10.00]Middle\n",
+        )
+        .expect("Should parse BOM LRC with offset and duplicate timestamps");
+
+        assert_eq!(lrc.title.as_deref(), Some("Song Title"));
+        assert_eq!(lrc.artist.as_deref(), Some("Artist"));
+        assert_eq!(lrc.album.as_deref(), Some("Album"));
+        assert_eq!(lrc.lines.len(), 3);
+        // [00:02.00] - 5.0s offset clamps to 0.0; sorted ascending
+        assert_eq!(lrc.lines[0].time_seconds, 0.0);
+        assert!((lrc.lines[1].time_seconds - 5.0).abs() < 1e-4);
+        assert!((lrc.lines[2].time_seconds - 15.0).abs() < 1e-4);
+
+        assert_eq!(lrc.find_current_line_idx(-0.1), None);
+        assert_eq!(lrc.find_current_line_idx(0.0), Some(0));
+        assert_eq!(lrc.find_current_line_idx(5.0), Some(1));
+        assert_eq!(lrc.find_current_line_idx(99.0), Some(2));
+    }
+
+    #[test]
+    fn test_sidecar_discovery_case_suffix_and_lyrics_subdir() {
+        let temp_dir = TempTestDir::new("subdirs");
+
+        // 1. Uppercase .LRC
+        let song_upper = temp_dir.path().join("UpperTrack.mp3");
+        let lrc_upper = temp_dir.path().join("UpperTrack.LRC");
+        fs::write(&song_upper, b"x").unwrap();
+        fs::write(&lrc_upper, "[00:01.00]Upper ext\n").unwrap();
+        assert_eq!(
+            find_sidecar_lrc_path(&song_upper.to_string_lossy()),
+            Some(lrc_upper)
+        );
+
+        // 2. <filename>.flac.lrc
+        let song_full = temp_dir.path().join("FullExt.flac");
+        let lrc_full = temp_dir.path().join("FullExt.flac.lrc");
+        fs::write(&song_full, b"x").unwrap();
+        fs::write(&lrc_full, "[00:01.00]Full ext\n").unwrap();
+        assert_eq!(
+            find_sidecar_lrc_path(&song_full.to_string_lossy()),
+            Some(lrc_full)
+        );
+
+        // 3. lyrics/<stem>.lrc subdirectory
+        let song_sub = temp_dir.path().join("SubTrack.ogg");
+        let lyrics_dir = temp_dir.path().join("lyrics");
+        fs::create_dir_all(&lyrics_dir).unwrap();
+        let lrc_sub = lyrics_dir.join("SubTrack.lrc");
+        fs::write(&song_sub, b"x").unwrap();
+        fs::write(&lrc_sub, "[00:01.00]Subdir lyric\n").unwrap();
+        assert_eq!(
+            find_sidecar_lrc_path(&song_sub.to_string_lossy()),
+            Some(lrc_sub)
+        );
     }
 
     #[test]

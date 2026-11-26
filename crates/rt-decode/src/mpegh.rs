@@ -582,4 +582,96 @@ mod tests {
         assert_eq!(u16::from_le_bytes([pause_burst[6], pause_burst[7]]), 0);
         assert!(pause_burst[8..].iter().all(|&b| b == 0));
     }
+
+    #[test]
+    fn test_iec61937_rate_factors_endianness_and_error_guards() {
+        for bad in [0, 1, 2, 8, 32] {
+            assert!(Iec61937MpeghPackager::new(bad, true).is_err());
+        }
+
+        // rate_factor = 16 -> 65536-byte burst, rateFactorCode = 3
+        let p16 = Iec61937MpeghPackager::new(16, false).expect("valid rate factor 16");
+        assert_eq!(p16.rate_factor(), 16);
+        assert_eq!(p16.burst_size_bytes(), 65536);
+
+        let mut burst = Vec::new();
+        // Odd-length payload + swap_bytes_s16le=false keeps big-endian IEC preamble
+        let payload = [0xAAu8, 0xBB, 0xCC];
+        p16.package_mhas_frame(&payload, &mut burst)
+            .expect("package odd-length MHAS frame");
+        assert_eq!(burst.len(), 65536);
+        assert_eq!(&burst[0..4], &[0xF8, 0x72, 0x4E, 0x1F]);
+        let pc_be = u16::from_be_bytes([burst[4], burst[5]]);
+        assert_eq!((pc_be >> 11) & 0x3, 3);
+        assert_eq!((pc_be & 0x1F) as u8, IEC61937_DATA_TYPE_MPEGH);
+        assert_eq!(&burst[24..27], &payload);
+
+        // Odd-length payload with swap_bytes_s16le=true rounds active swap region cleanly
+        let p4 = Iec61937MpeghPackager::new(4, true).unwrap();
+        p4.package_mhas_frame(&payload, &mut burst).unwrap();
+        assert_eq!(u16::from_le_bytes([burst[0], burst[1]]), IEC61937_SYNC_PA);
+        // Bytes 24..27 swapped pairwise over even len 28: [24]=0xBB, [25]=0xAA, [26]=0x00, [27]=0xCC
+        assert_eq!(&burst[24..28], &[0xBB, 0xAA, 0x00, 0xCC]);
+
+        // Oversized payload returns Err
+        let too_big = vec![0u8; p4.burst_size_bytes()];
+        assert!(p4.package_mhas_frame(&too_big, &mut burst).is_err());
+    }
+
+    #[test]
+    fn test_mhas_bitwriter_escaped_values_unaligned_and_channel_remap() {
+        let mut bw = MhasBitWriter::with_capacity(64);
+        // 3 tiers of escapedValue(3, 4, 8):
+        // val=5 (<7) -> 3 bits (0b101)
+        bw.write_escaped_value(5, 3, 4, 8);
+        assert_eq!(bw.as_bytes(), &[0b101_00000]);
+
+        bw.clear();
+        // val=10 (7 <= 10 < 7+15=22) -> 0b111 (3b) + 3 (0b0011, 4b) = 0b1110011_0 = 0xE6
+        bw.write_escaped_value(10, 3, 4, 8);
+        assert_eq!(bw.as_bytes(), &[0xE6]);
+
+        bw.clear();
+        // val=25 (>= 22) -> 0b111 (3b) + 0b1111 (4b) + 3 (8b) = 15 bits: 1111_1110_0000_0110 -> [0xFE, 0x06]
+        bw.write_escaped_value(25, 3, 4, 8);
+        assert_eq!(bw.as_bytes(), &[0xFE, 0x06]);
+
+        // Unaligned write_mhas_packet after writing 3 prefix bits preserves payload bytes bitwise
+        bw.clear();
+        bw.write_bits(0b101, 3);
+        bw.write_mhas_packet(6, 0, &[0xA5, 0x5A]);
+        // 3 prefix bits + 16 header bits = 19 bits; payload starts at bit 19 (offset 2 bytes + 3 bits)
+        assert_eq!(bw.as_bytes().len(), 5);
+
+        // Channel remap verifies RL/RR <-> BL/BR swap (indices 4..8)
+        let rt: [f32; 12] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0];
+        let cicp = remap_rusttracker_714_to_cicp19(&rt);
+        assert_eq!(
+            cicp,
+            [0.0, 1.0, 2.0, 3.0, 6.0, 7.0, 4.0, 5.0, 8.0, 9.0, 10.0, 11.0]
+        );
+    }
+
+    #[test]
+    fn test_mpegh_encoder_clear_accumulator_and_multiframe_sequence() {
+        let mut enc = Mpegh714Encoder::new(4, true).expect("Mpegh714Encoder::new");
+        let mut queue = VecDeque::new();
+        let frame = [0.1f32; 12];
+
+        for _ in 0..500 {
+            assert!(!enc.push_rusttracker_714_frame(&frame, &mut queue).unwrap());
+        }
+        enc.clear_accumulator();
+        assert!(queue.is_empty());
+
+        // Encode 8 complete frames (8 * 1024 samples) after clearing accumulator
+        let mut burst_count = 0usize;
+        for _ in 0..(8 * 1024) {
+            if enc.push_rusttracker_714_frame(&frame, &mut queue).unwrap() {
+                burst_count += 1;
+            }
+        }
+        assert_eq!(burst_count, 8);
+        assert_eq!(queue.len(), 8 * 16384);
+    }
 }

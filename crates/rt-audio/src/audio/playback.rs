@@ -4382,7 +4382,7 @@ fn run_wasapi_exclusive_multichannel(
 }
 
 #[inline(always)]
-fn copy_ring_buffer(dst: &mut [f32], src: &[f32], split_idx: usize) {
+pub(in crate::audio) fn copy_ring_buffer(dst: &mut [f32], src: &[f32], split_idx: usize) {
     let window_size = dst.len();
     let split = split_idx.min(window_size);
     let tail_len = window_size - split;

@@ -100,6 +100,25 @@ impl TouchGestureController {
         is_portrait: bool,
         split_y: f32,
     ) -> Option<TouchGesture> {
+        self.handle_touch_at(
+            touch,
+            window_width,
+            window_height,
+            is_portrait,
+            split_y,
+            Instant::now(),
+        )
+    }
+
+    pub(crate) fn handle_touch_at(
+        &mut self,
+        touch: &TouchEvent,
+        window_width: f32,
+        window_height: f32,
+        is_portrait: bool,
+        split_y: f32,
+        now: Instant,
+    ) -> Option<TouchGesture> {
         let x = touch.x as f32;
         let y = touch.y as f32;
         if !x.is_finite()
@@ -119,7 +138,6 @@ impl TouchGestureController {
         match touch.phase {
             TouchPhase::Started => {
                 // Evict stale pointers whose Ended/Cancelled event was lost (> 30s)
-                let now = Instant::now();
                 self.active_touches.retain(|_, (_, _, t0)| {
                     now.saturating_duration_since(*t0) < Duration::from_secs(30)
                 });
@@ -191,7 +209,7 @@ impl TouchGestureController {
                         let count = self.max_touch_count;
                         let dt = self
                             .multi_finger_start_time
-                            .map(|t| t.elapsed().as_secs_f32())
+                            .map(|t| now.saturating_duration_since(t).as_secs_f32())
                             .unwrap_or(1.0);
                         self.max_touch_count = 0;
                         self.multi_finger_start_time = None;
@@ -224,7 +242,7 @@ impl TouchGestureController {
                 let dx = x - start_x;
                 let dy = y - start_y;
                 let dist = (dx * dx + dy * dy).sqrt();
-                let dt = start_time.elapsed().as_secs_f32();
+                let dt = now.saturating_duration_since(start_time).as_secs_f32();
 
                 self.touch_start_pos = None;
                 self.touch_start_time = None;
@@ -282,12 +300,11 @@ impl TouchGestureController {
 
                 // Check for tap gestures (moved < 24dp in < 280ms)
                 if dist < tap_max_move_px && dt < 0.28 {
-                    let now = Instant::now();
                     if let (Some(last_time), Some((lx, ly))) =
                         (self.last_tap_time, self.last_tap_pos)
                     {
                         let tap_dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                        if now.duration_since(last_time) < Duration::from_millis(280)
+                        if now.saturating_duration_since(last_time) < Duration::from_millis(280)
                             && tap_dist < double_tap_max_dist_px
                         {
                             self.last_tap_time = None;
@@ -324,8 +341,12 @@ impl TouchGestureController {
 
     /// Check if a pending single tap has expired
     pub fn update_pending_tap(&mut self) -> Option<TouchGesture> {
+        self.update_pending_tap_at(Instant::now())
+    }
+
+    pub(crate) fn update_pending_tap_at(&mut self, now: Instant) -> Option<TouchGesture> {
         if let Some(((x, y), tap_time)) = self.pending_single_tap
-            && tap_time.elapsed() >= Duration::from_millis(280)
+            && now.saturating_duration_since(tap_time) >= Duration::from_millis(280)
         {
             self.pending_single_tap = None;
             return Some(TouchGesture::SingleTap { x, y });
@@ -527,6 +548,53 @@ mod tests {
                 y: 1535.0
             })
         );
+
+        // At 3.0x DPI, swipe_min_px = 135px: 50px drag is NOT a swipe, 150px drag IS a swipe
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        assert_eq!(
+            controller.handle_touch(
+                &make_touch(TouchPhase::Moved, 0, 550.0, 500.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+            ),
+            None
+        );
+        assert_eq!(
+            controller.handle_touch(
+                &make_touch(TouchPhase::Ended, 0, 550.0, 500.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+            ),
+            None
+        );
+
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        assert_eq!(
+            controller.handle_touch(
+                &make_touch(TouchPhase::Ended, 0, 650.0, 500.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+            ),
+            Some(TouchGesture::TopPaneSwipeRight)
+        );
     }
 
     #[test]
@@ -690,6 +758,297 @@ mod tests {
                 1000.0,
             ),
             Some(TouchGesture::ScrubCancel)
+        );
+    }
+
+    #[test]
+    fn test_deterministic_tap_timeout_and_duration_thresholds() {
+        let mut controller = TouchGestureController::new();
+        let t0 = Instant::now();
+
+        // Quick tap down/up queues a delayed SingleTap until >= 280ms
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Started, 0, 300.0, 400.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                t0,
+            ),
+            None
+        );
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Ended, 0, 302.0, 401.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                t0 + Duration::from_millis(50),
+            ),
+            None
+        );
+        assert_eq!(
+            controller.update_pending_tap_at(t0 + Duration::from_millis(250)),
+            None
+        );
+        assert_eq!(
+            controller.update_pending_tap_at(t0 + Duration::from_millis(330)),
+            Some(TouchGesture::SingleTap { x: 302.0, y: 401.0 })
+        );
+        // Fires once
+        assert_eq!(
+            controller.update_pending_tap_at(t0 + Duration::from_millis(500)),
+            None
+        );
+
+        // Slow press (>= 280ms) does not register as a tap
+        let t1 = t0 + Duration::from_secs(2);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 0, 300.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t1,
+        );
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Ended, 0, 300.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t1 + Duration::from_millis(300),
+        );
+        assert_eq!(
+            controller.update_pending_tap_at(t1 + Duration::from_secs(1)),
+            None
+        );
+
+        // Slow drag (>= 600ms) is not a swipe
+        let t2 = t0 + Duration::from_secs(5);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 0, 100.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t2,
+        );
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Ended, 0, 300.0, 400.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                t2 + Duration::from_millis(650),
+            ),
+            None
+        );
+
+        // Slow 2-finger hold (>= 500ms) is not a TwoFingerTap
+        let t3 = t0 + Duration::from_secs(8);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 0, 100.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t3,
+        );
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 1, 200.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t3 + Duration::from_millis(10),
+        );
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Ended, 0, 100.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t3 + Duration::from_millis(550),
+        );
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Ended, 1, 200.0, 400.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                t3 + Duration::from_millis(560),
+            ),
+            None
+        );
+
+        // Second tap far apart (> 42dp) is not a DoubleTap
+        let t4 = t0 + Duration::from_secs(12);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 0, 100.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t4,
+        );
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Ended, 0, 100.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t4 + Duration::from_millis(40),
+        );
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 0, 200.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            t4 + Duration::from_millis(100),
+        );
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Ended, 0, 200.0, 400.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                t4 + Duration::from_millis(140),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_landscape_portrait_directions_nan_guards_and_stale_pointer_eviction() {
+        let mut controller = TouchGestureController::new();
+        controller.set_scale_factor(-2.0);
+        controller.set_scale_factor(f32::NAN);
+
+        // Non-finite inputs return None without poisoning state
+        assert_eq!(
+            controller.handle_touch(
+                &make_touch(TouchPhase::Started, 0, f64::NAN, 100.0),
+                1920.0,
+                1080.0,
+                false,
+                540.0,
+            ),
+            None
+        );
+
+        let t0 = Instant::now();
+        // Landscape 4-direction swipes
+        let landscape_cases = [
+            (
+                (500.0, 400.0),
+                (350.0, 400.0),
+                TouchGesture::LandscapeSwipeLeft,
+            ),
+            (
+                (500.0, 400.0),
+                (650.0, 400.0),
+                TouchGesture::LandscapeSwipeRight,
+            ),
+            (
+                (500.0, 500.0),
+                (500.0, 350.0),
+                TouchGesture::LandscapeSwipeUp,
+            ),
+            (
+                (500.0, 350.0),
+                (500.0, 500.0),
+                TouchGesture::LandscapeSwipeDown,
+            ),
+        ];
+        for (idx, (start, end, expected)) in landscape_cases.into_iter().enumerate() {
+            let base = t0 + Duration::from_secs(idx as u64 + 1);
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Started, 0, start.0, start.1),
+                1920.0,
+                1080.0,
+                false,
+                540.0,
+                base,
+            );
+            assert_eq!(
+                controller.handle_touch_at(
+                    &make_touch(TouchPhase::Ended, 0, end.0, end.1),
+                    1920.0,
+                    1080.0,
+                    false,
+                    540.0,
+                    base + Duration::from_millis(80),
+                ),
+                Some(expected)
+            );
+        }
+
+        // Portrait bottom pane vertical swipes
+        for (idx, (sy, ey, expected)) in [
+            (1500.0, 1350.0, TouchGesture::BottomPaneSwipeUp),
+            (1350.0, 1500.0, TouchGesture::BottomPaneSwipeDown),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = t0 + Duration::from_secs(10 + idx as u64);
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Started, 0, 400.0, sy),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                base,
+            );
+            assert_eq!(
+                controller.handle_touch_at(
+                    &make_touch(TouchPhase::Ended, 0, 400.0, ey),
+                    1080.0,
+                    2400.0,
+                    true,
+                    1200.0,
+                    base + Duration::from_millis(80),
+                ),
+                Some(expected)
+            );
+        }
+
+        // Stale pointer eviction: pointer 0 started > 30s ago is evicted when pointer 1 starts
+        let stale_start = t0 + Duration::from_secs(20);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 99, 200.0, 300.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            stale_start,
+        );
+        let fresh_start = stale_start + Duration::from_secs(35);
+        controller.handle_touch_at(
+            &make_touch(TouchPhase::Started, 1, 200.0, 400.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+            fresh_start,
+        );
+        assert_eq!(
+            controller.handle_touch_at(
+                &make_touch(TouchPhase::Ended, 1, 350.0, 400.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+                fresh_start + Duration::from_millis(60),
+            ),
+            Some(TouchGesture::TopPaneSwipeRight)
         );
     }
 }

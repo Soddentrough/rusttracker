@@ -684,6 +684,310 @@ pub(crate) fn render_track_info_open_area(
     )
 }
 
+/// Returns true when `artist` contains a meaningful non-placeholder artist name.
+pub(crate) fn should_display_artist(artist: &str) -> bool {
+    let trimmed = artist.trim();
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("unknown")
+        && !trimmed.eq_ignore_ascii_case("unknown artist")
+}
+
+/// Builds `(format_name, channel_info, mobile_audio_line)` for the Track Info overlay.
+pub(crate) fn format_track_audio_summary(
+    state: &AppState,
+    file_path: &std::path::Path,
+    effective_bitrate: Option<u32>,
+) -> (String, String, String) {
+    let format_name = if let Some(track) = state.audio_tracks.get(state.selected_audio_track) {
+        if !track.codec.is_empty()
+            && !state
+                .module_type
+                .to_ascii_uppercase()
+                .contains(&track.codec.to_ascii_uppercase())
+        {
+            format!("{}/{}", track.codec, state.module_type)
+        } else {
+            state.module_type.clone()
+        }
+    } else {
+        state.module_type.clone()
+    };
+
+    let format_name = if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+        let ext_upper = ext.to_ascii_uppercase();
+        if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
+            && !format_name.to_ascii_uppercase().contains(&ext_upper)
+        {
+            format!("{}/{}", format_name, ext_upper)
+        } else {
+            format_name
+        }
+    } else {
+        format_name
+    };
+
+    let ch_info = if state.is_native_atmos {
+        "Dolby Atmos (7.1.4)".to_string()
+    } else if state.stats.mpegh_bitstream_active {
+        let is_atmos_spatial = state.stats.mpegh_carrier_info.contains("SpatialAudio")
+            || state.stats.mpegh_carrier_info.contains("Dolby");
+        let carrier_tag = if is_atmos_spatial {
+            "Dolby Atmos"
+        } else {
+            "MPEG-H"
+        };
+        if let Some(tc) = state.tracker_channels {
+            format!("11.1 {} (12ch) / {} tracker", carrier_tag, tc)
+        } else if state.source_channels >= 12 {
+            format!("11.1 {} (7.1.4 / 12ch)", carrier_tag)
+        } else {
+            let src_label = match state.source_channels {
+                1 => "Mono (1ch)".to_string(),
+                2 => "Stereo (2ch)".to_string(),
+                6 => "5.1 (6ch)".to_string(),
+                8 => "7.1 (8ch)".to_string(),
+                10 => "7.1.2 (10ch)".to_string(),
+                n => format!("{}ch", n.max(1)),
+            };
+            if state
+                .surround_upmix
+                .is_active_for(state.source_channels, state.hardware_channels)
+            {
+                format!("{} -> 7.1.4 {} Upmix (12ch)", src_label, carrier_tag)
+            } else {
+                format!("{} via {} 7.1.4", src_label, carrier_tag)
+            }
+        }
+    } else if let Some(tc) = state.tracker_channels {
+        format!("{} hw / {} tracker", state.hardware_channels, tc)
+    } else if state.num_channels == 1 {
+        "1-channel".to_string()
+    } else {
+        format!("{}-channels", state.num_channels)
+    };
+
+    let mobile_audio_val = if let Some(br) = effective_bitrate {
+        format!("{}, {}, {} kbps", format_name, ch_info, br)
+    } else {
+        format!("{}, {}", format_name, ch_info)
+    };
+
+    (format_name, ch_info, mobile_audio_val)
+}
+
+/// Renders the responsive Quick Mix preset buttons (`All On`, `Mix 1&2`, and per-track solo)
+/// and returns the bounding rectangle of the preset block.
+pub(crate) fn render_quick_mix_presets(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    engine_action: &mut Vec<EngineAction>,
+) -> egui::Rect {
+    ui.scope(|ui| {
+        ui.add_space(5.0);
+        ui.label(
+            egui::RichText::new("Quick Mix Presets:")
+                .size(12.0)
+                .color(egui::Color32::from_rgb(170, 190, 210))
+                .strong(),
+        );
+        ui.add_space(2.0);
+
+        let num_tracks = state.audio_tracks.len();
+        let is_all_on = state.active_audio_tracks.len() == num_tracks && num_tracks > 0;
+        let is_mix_1_2 = state.active_audio_tracks.len() == 2
+            && state.active_audio_tracks.contains(&0)
+            && state.active_audio_tracks.contains(&1);
+
+        let total_width = ui.available_width();
+        let spacing = 6.0;
+        let is_compact = cfg!(target_os = "android") || total_width < 420.0;
+        let btn_h = 34.0;
+
+        let render_all_on =
+            |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut Vec<EngineAction>| {
+                let all_btn =
+                    egui::Button::new(egui::RichText::new("All On").strong().size(12.0).color(
+                        if is_all_on {
+                            egui::Color32::from_rgb(0, 240, 170)
+                        } else {
+                            egui::Color32::LIGHT_GRAY
+                        },
+                    ))
+                    .fill(if is_all_on {
+                        egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220)
+                    })
+                    .stroke(if is_all_on {
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170))
+                    } else {
+                        egui::Stroke::NONE
+                    });
+
+                if ui.add_sized([w, h], all_btn).clicked() {
+                    let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
+                    engine_action.push(EngineAction::SetAudioMixTracks(all_mix));
+                }
+            };
+
+        let render_mix_1_2 =
+            |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut Vec<EngineAction>| {
+                let mix_btn =
+                    egui::Button::new(egui::RichText::new("Mix 1&2").strong().size(12.0).color(
+                        if is_mix_1_2 {
+                            egui::Color32::from_rgb(0, 240, 170)
+                        } else {
+                            egui::Color32::from_rgb(0, 210, 160)
+                        },
+                    ))
+                    .fill(if is_mix_1_2 {
+                        egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180)
+                    })
+                    .stroke(if is_mix_1_2 {
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170))
+                    } else {
+                        egui::Stroke::NONE
+                    });
+
+                if ui.add_sized([w, h], mix_btn).clicked() {
+                    engine_action.push(EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]));
+                }
+            };
+
+        let render_solo = |ui: &mut egui::Ui,
+                           track_idx: usize,
+                           w: f32,
+                           h: f32,
+                           engine_action: &mut Vec<EngineAction>| {
+            let is_solo = state.active_audio_tracks.len() == 1
+                && state.active_audio_tracks.contains(&track_idx);
+            let label = if num_tracks == 2 {
+                let t_opt = state.audio_tracks.get(track_idx);
+                let t_lower = t_opt.map(|t| t.title.to_lowercase()).unwrap_or_default();
+                if track_idx == 0
+                    && (t_lower.contains("instrumental")
+                        || t_lower.contains("karaoke")
+                        || t_lower.contains("music"))
+                {
+                    "Trk 1 (Music)".to_string()
+                } else if track_idx == 1
+                    && (t_lower.contains("vocal")
+                        || t_lower.contains("guide")
+                        || t_lower.contains("full mix")
+                        || t_lower.contains("fullmix"))
+                {
+                    "Trk 2 (Vocals)".to_string()
+                } else {
+                    format!("Trk {}", track_idx + 1)
+                }
+            } else {
+                format!("Trk {}", track_idx + 1)
+            };
+            let btn = egui::Button::new(egui::RichText::new(label).strong().size(12.0).color(
+                if is_solo {
+                    egui::Color32::from_rgb(0, 220, 255)
+                } else {
+                    egui::Color32::LIGHT_GRAY
+                },
+            ))
+            .fill(if is_solo {
+                egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220)
+            })
+            .stroke(if is_solo {
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255))
+            } else {
+                egui::Stroke::NONE
+            });
+
+            if ui.add_sized([w, h], btn).clicked() {
+                engine_action.push(EngineAction::SetAudioMixTracks(vec![(track_idx, 1.0)]));
+            }
+        };
+
+        if num_tracks <= 2 {
+            if is_compact {
+                let row_w = ((total_width - spacing) / 2.0).max(60.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    render_all_on(ui, row_w, btn_h, engine_action);
+                    if num_tracks >= 2 {
+                        render_mix_1_2(ui, row_w, btn_h, engine_action);
+                    }
+                });
+                if num_tracks >= 2 {
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        render_solo(ui, 0, row_w, btn_h, engine_action);
+                        render_solo(ui, 1, row_w, btn_h, engine_action);
+                    });
+                }
+            } else {
+                let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
+                let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    render_all_on(ui, btn_w, btn_h, engine_action);
+                    render_solo(ui, 0, btn_w, btn_h, engine_action);
+                    if num_tracks >= 2 {
+                        render_solo(ui, 1, btn_w, btn_h, engine_action);
+                        render_mix_1_2(ui, btn_w, btn_h, engine_action);
+                    }
+                });
+            }
+        } else {
+            let row1_w = ((total_width - spacing) / 2.0).max(60.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = spacing;
+                render_all_on(ui, row1_w, btn_h, engine_action);
+                render_mix_1_2(ui, row1_w, btn_h, engine_action);
+            });
+
+            ui.add_space(3.0);
+
+            let display_count = num_tracks.min(4);
+            if is_compact {
+                let chunks: Vec<Vec<usize>> = (0..display_count)
+                    .collect::<Vec<_>>()
+                    .chunks(2)
+                    .map(|c| c.to_vec())
+                    .collect();
+                for (c_idx, chunk) in chunks.iter().enumerate() {
+                    let chunk_w = ((total_width - spacing * (chunk.len() - 1) as f32)
+                        / chunk.len() as f32)
+                        .max(45.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = spacing;
+                        for &idx in chunk {
+                            render_solo(ui, idx, chunk_w, 32.0, engine_action);
+                        }
+                    });
+                    if c_idx + 1 < chunks.len() {
+                        ui.add_space(3.0);
+                    }
+                }
+            } else {
+                let row2_w = ((total_width - spacing * (display_count - 1) as f32)
+                    / display_count as f32)
+                    .max(45.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    for idx in 0..display_count {
+                        render_solo(ui, idx, row2_w, 32.0, engine_action);
+                    }
+                });
+            }
+        }
+        ui.add_space(4.0);
+    })
+    .response
+    .rect
+}
+
 pub(crate) fn render_heatmap_eq_header(
     ui: &mut egui::Ui,
     show_surround_eq: bool,
@@ -3782,10 +4086,7 @@ impl VulkanEngine {
 
                                                     // 2. Artist (only display if known)
                                                     let trimmed_artist = state.artist.trim();
-                                                    if !trimmed_artist.is_empty()
-                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown")
-                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown artist")
-                                                    {
+                                                    if should_display_artist(trimmed_artist) {
                                                         ui.label(egui::RichText::new("Artist:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                         render_smooth_marquee(ui, trimmed_artist, 14.0, false);
                                                         ui.end_row();
@@ -3827,79 +4128,11 @@ impl VulkanEngine {
                                                         }
                                                     });
 
-                                                    let format_name = if let Some(track) = state.audio_tracks.get(state.selected_audio_track) {
-                                                        if !track.codec.is_empty()
-                                                            && !state.module_type.to_ascii_uppercase().contains(&track.codec.to_ascii_uppercase())
-                                                        {
-                                                            format!("{}/{}", track.codec, state.module_type)
-                                                        } else {
-                                                            state.module_type.clone()
-                                                        }
-                                                    } else {
-                                                        state.module_type.clone()
-                                                    };
-
-                                                    let format_name = if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
-                                                        let ext_upper = ext.to_ascii_uppercase();
-                                                        if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
-                                                            && !format_name.to_ascii_uppercase().contains(&ext_upper)
-                                                        {
-                                                            format!("{}/{}", format_name, ext_upper)
-                                                        } else {
-                                                            format_name
-                                                        }
-                                                    } else {
-                                                        format_name
-                                                    };
-
-                                                    let ch_info = if state.is_native_atmos {
-                                                        "Dolby Atmos (7.1.4)".to_string()
-                                                    } else if state.stats.mpegh_bitstream_active {
-                                                        let is_atmos_spatial = state
-                                                            .stats
-                                                            .mpegh_carrier_info
-                                                            .contains("SpatialAudio")
-                                                            || state.stats.mpegh_carrier_info.contains("Dolby");
-                                                        let carrier_tag = if is_atmos_spatial {
-                                                            "Dolby Atmos"
-                                                        } else {
-                                                            "MPEG-H"
-                                                        };
-                                                        if let Some(tc) = state.tracker_channels {
-                                                            format!("11.1 {} (12ch) / {} tracker", carrier_tag, tc)
-                                                        } else if state.source_channels >= 12 {
-                                                            format!("11.1 {} (7.1.4 / 12ch)", carrier_tag)
-                                                        } else {
-                                                            let src_label = match state.source_channels {
-                                                                1 => "Mono (1ch)".to_string(),
-                                                                2 => "Stereo (2ch)".to_string(),
-                                                                6 => "5.1 (6ch)".to_string(),
-                                                                8 => "7.1 (8ch)".to_string(),
-                                                                10 => "7.1.2 (10ch)".to_string(),
-                                                                n => format!("{}ch", n.max(1)),
-                                                            };
-                                                            if state.surround_upmix.is_active_for(state.source_channels, state.hardware_channels) {
-                                                                format!("{} -> 7.1.4 {} Upmix (12ch)", src_label, carrier_tag)
-                                                            } else {
-                                                                format!("{} via {} 7.1.4", src_label, carrier_tag)
-                                                            }
-                                                        }
-                                                    } else if let Some(tc) = state.tracker_channels {
-                                                        format!("{} hw / {} tracker", state.hardware_channels, tc)
-                                                    } else if state.num_channels == 1 {
-                                                        "1-channel".to_string()
-                                                    } else {
-                                                        format!("{}-channels", state.num_channels)
-                                                    };
+                                                    let (format_name, ch_info, audio_val) = format_track_audio_summary(state, file_path, effective_bitrate);
 
                                                     if is_portrait {
                                                         // In mobile view: "Audio: AAC/MP4, X-channels, Y bitrate"
                                                         ui.label(egui::RichText::new("Audio:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                        let audio_val = if let Some(br) = effective_bitrate {
-                                                            format!("{}, {}, {} kbps", format_name, ch_info, br)
-                                                        } else {
-                                                            format!("{}, {}", format_name, ch_info)
-                                                        };
                                                         ui.label(audio_val);
                                                         ui.end_row();
                                                     } else {
@@ -4142,145 +4375,7 @@ impl VulkanEngine {
                                                 }
 
                                                 // Quick Mix Presets Bar (Always Available)
-                                                ui.add_space(5.0);
-                                                ui.label(egui::RichText::new("Quick Mix Presets:").size(12.0).color(egui::Color32::from_rgb(170, 190, 210)).strong());
-                                                ui.add_space(2.0);
-
-                                                let num_tracks = state.audio_tracks.len();
-                                                let is_all_on = state.active_audio_tracks.len() == num_tracks && num_tracks > 0;
-                                                let is_mix_1_2 = state.active_audio_tracks.len() == 2 && state.active_audio_tracks.contains(&0) && state.active_audio_tracks.contains(&1);
-
-                                                 let total_width = ui.available_width();
-                                                 let spacing = 6.0;
-                                                 let is_compact = cfg!(target_os = "android") || total_width < 420.0;
-                                                 let btn_h = 34.0;
-
-                                                 let render_all_on = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut Vec<EngineAction>| {
-                                                     let all_btn = egui::Button::new(
-                                                         egui::RichText::new("All On").strong().size(12.0).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
-                                                     )
-                                                     .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                     .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
-
-                                                     if ui.add_sized([w, h], all_btn).clicked() {
-                                                         let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
-                                                         engine_action.push(EngineAction::SetAudioMixTracks(all_mix));
-                                                     }
-                                                 };
-
-                                                 let render_mix_1_2 = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut Vec<EngineAction>| {
-                                                     let mix_btn = egui::Button::new(
-                                                         egui::RichText::new("Mix 1&2").strong().size(12.0).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
-                                                     )
-                                                     .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
-                                                     .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
-
-                                                     if ui.add_sized([w, h], mix_btn).clicked() {
-                                                         engine_action.push(EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]));
-                                                     }
-                                                 };
-
-                                                 let render_solo = |ui: &mut egui::Ui, track_idx: usize, w: f32, h: f32, engine_action: &mut Vec<EngineAction>| {
-                                                     let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&track_idx);
-                                                     let label = if num_tracks == 2 {
-                                                         let t_opt = state.audio_tracks.get(track_idx);
-                                                         let t_lower = t_opt.map(|t| t.title.to_lowercase()).unwrap_or_default();
-                                                         if track_idx == 0 && (t_lower.contains("instrumental") || t_lower.contains("karaoke") || t_lower.contains("music")) {
-                                                             "Trk 1 (Music)".to_string()
-                                                         } else if track_idx == 1 && (t_lower.contains("vocal") || t_lower.contains("guide") || t_lower.contains("full mix") || t_lower.contains("fullmix")) {
-                                                             "Trk 2 (Vocals)".to_string()
-                                                         } else {
-                                                             format!("Trk {}", track_idx + 1)
-                                                         }
-                                                     } else {
-                                                         format!("Trk {}", track_idx + 1)
-                                                     };
-                                                     let btn = egui::Button::new(
-                                                         egui::RichText::new(label).strong().size(12.0).color(if is_solo { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
-                                                     )
-                                                     .fill(if is_solo { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                     .stroke(if is_solo { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
-
-                                                     if ui.add_sized([w, h], btn).clicked() {
-                                                         engine_action.push(EngineAction::SetAudioMixTracks(vec![(track_idx, 1.0)]));
-                                                     }
-                                                 };
-
-                                                 if num_tracks <= 2 {
-                                                     if is_compact {
-                                                         // 2 rows on mobile/narrow screen:
-                                                         // Row 1: [All On] [Mix 1&2] (50% width each)
-                                                         let row_w = ((total_width - spacing) / 2.0).max(60.0);
-                                                         ui.horizontal(|ui| {
-                                                             ui.spacing_mut().item_spacing.x = spacing;
-                                                             render_all_on(ui, row_w, btn_h, engine_action);
-                                                             if num_tracks >= 2 {
-                                                                 render_mix_1_2(ui, row_w, btn_h, engine_action);
-                                                             }
-                                                         });
-                                                         if num_tracks >= 2 {
-                                                             ui.add_space(3.0);
-                                                             // Row 2: [Trk 1] [Trk 2] (50% width each)
-                                                             ui.horizontal(|ui| {
-                                                                 ui.spacing_mut().item_spacing.x = spacing;
-                                                                 render_solo(ui, 0, row_w, btn_h, engine_action);
-                                                                 render_solo(ui, 1, row_w, btn_h, engine_action);
-                                                             });
-                                                         }
-                                                     } else {
-                                                         // Wide screen: 4 buttons in a single row
-                                                         let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
-                                                         let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
-                                                         ui.horizontal(|ui| {
-                                                             ui.spacing_mut().item_spacing.x = spacing;
-                                                             render_all_on(ui, btn_w, btn_h, engine_action);
-                                                             render_solo(ui, 0, btn_w, btn_h, engine_action);
-                                                             if num_tracks >= 2 {
-                                                                 render_solo(ui, 1, btn_w, btn_h, engine_action);
-                                                                 render_mix_1_2(ui, btn_w, btn_h, engine_action);
-                                                             }
-                                                         });
-                                                     }
-                                                 } else {
-                                                     // 3+ tracks:
-                                                     // Row 1: Mix combos [All On] [Mix 1&2] (each 50% width)
-                                                     let row1_w = ((total_width - spacing) / 2.0).max(60.0);
-                                                     ui.horizontal(|ui| {
-                                                         ui.spacing_mut().item_spacing.x = spacing;
-                                                         render_all_on(ui, row1_w, btn_h, engine_action);
-                                                         render_mix_1_2(ui, row1_w, btn_h, engine_action);
-                                                     });
-
-                                                     ui.add_space(3.0);
-
-                                                     let display_count = num_tracks.min(4);
-                                                     if is_compact {
-                                                         // Solo tracks in rows of 2 for mobile/narrow
-                                                         let chunks: Vec<Vec<usize>> = (0..display_count).collect::<Vec<_>>().chunks(2).map(|c| c.to_vec()).collect();
-                                                         for (c_idx, chunk) in chunks.iter().enumerate() {
-                                                             let chunk_w = ((total_width - spacing * (chunk.len() - 1) as f32) / chunk.len() as f32).max(45.0);
-                                                             ui.horizontal(|ui| {
-                                                                 ui.spacing_mut().item_spacing.x = spacing;
-                                                                 for &idx in chunk {
-                                                                     render_solo(ui, idx, chunk_w, 32.0, engine_action);
-                                                                 }
-                                                             });
-                                                             if c_idx + 1 < chunks.len() {
-                                                                 ui.add_space(3.0);
-                                                             }
-                                                         }
-                                                     } else {
-                                                         // Wide screen: all solo tracks in a single row
-                                                         let row2_w = ((total_width - spacing * (display_count - 1) as f32) / display_count as f32).max(45.0);
-                                                         ui.horizontal(|ui| {
-                                                             ui.spacing_mut().item_spacing.x = spacing;
-                                                             for idx in 0..display_count {
-                                                                 render_solo(ui, idx, row2_w, 32.0, engine_action);
-                                                             }
-                                                         });
-                                                     }
-                                                 }
-                                                ui.add_space(4.0);
+                                                let _ = render_quick_mix_presets(ui, state, engine_action);
                                             }
 
                                             ui.horizontal(|ui| {

@@ -1,174 +1,181 @@
+mod common;
+
 use rusttracker::{audio, state};
 
-#[test]
-fn test_multitrack_source_discovery_and_switching() {
-    let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: test file {} does not exist", test_file);
-        return;
-    }
-    let source_res = audio::load_audio_source(test_file);
-    assert!(
-        source_res.is_ok(),
-        "Failed to load test MKV: {:?}",
-        source_res.err()
-    );
-    let mut source = source_res.unwrap();
+fn verify_multitrack_source_discovery(path: &str, expected_codecs: &[&str]) {
+    let mut source = audio::load_audio_source(path)
+        .unwrap_or_else(|e| panic!("Failed to load multitrack media {path}: {e:?}"));
 
     let tracks = source.get_audio_tracks();
-    println!("Discovered {} audio tracks:", tracks.len());
-    for (idx, track) in tracks.iter().enumerate() {
-        println!(
-            "  [{}] Stream #{}: {} (codec: {}, channels: {}, rate: {}Hz, lang: {:?})",
-            idx,
-            track.id,
-            track.title,
-            track.codec,
-            track.channels,
-            track.sample_rate,
-            track.language
+    assert_eq!(
+        tracks.len(),
+        expected_codecs.len(),
+        "Expected {} audio tracks in {path}",
+        expected_codecs.len()
+    );
+    for (idx, expected) in expected_codecs.iter().enumerate() {
+        assert_eq!(
+            tracks[idx].codec, *expected,
+            "Track {idx} codec mismatch in {path}"
         );
     }
 
-    assert_eq!(tracks.len(), 4, "Expected 4 audio tracks in test MKV");
-    assert_eq!(tracks[0].codec, "TrueHD");
-    assert_eq!(tracks[1].codec, "AC3");
-    assert_eq!(tracks[2].codec, "E-AC3");
-    assert_eq!(tracks[3].codec, "AC3");
-
-    // Test switching to each track and reading audio frames
     let mut buffer = vec![0.0f32; 1024 * 2];
     for (idx, track) in tracks.iter().enumerate() {
-        let switch_res = source.select_audio_track(idx);
-        assert!(
-            switch_res.is_ok(),
-            "Failed to switch to audio track {}: {:?}",
-            idx,
-            switch_res.err()
-        );
+        source
+            .select_audio_track(idx)
+            .unwrap_or_else(|e| panic!("Failed to switch to track {idx} in {path}: {e:?}"));
         assert_eq!(source.get_selected_audio_track(), idx);
         assert_eq!(source.get_type(), track.codec);
 
         let frames = source.read_frames(2, 48000, &mut buffer);
-        println!("Track {} ({}): read {} frames", idx, track.codec, frames);
         assert!(
             frames > 0,
-            "Failed to read audio frames after switching to track {}",
-            idx
+            "Failed to read audio frames after switching to track {idx} in {path}"
         );
     }
 }
 
 #[test]
-fn test_multitrack_playback_switching_via_state() {
+fn test_multitrack_source_discovery_and_switching() {
+    let dir = common::TempTestDir::new("multitrack_discovery");
+    let synth_mkv = dir.path().join("synthetic_multitrack.mkv");
+    common::encode_synthetic_multitrack_mkv(&synth_mkv, 2.0)
+        .expect("encode synthetic multitrack MKV");
+    verify_multitrack_source_discovery(synth_mkv.to_str().unwrap(), &["AC3", "E-AC3", "AAC"]);
+
     let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: test file {} does not exist", test_file);
-        return;
+    if std::path::Path::new(test_file).exists() {
+        verify_multitrack_source_discovery(test_file, &["TrueHD", "AC3", "E-AC3", "AC3"]);
     }
+}
+
+fn verify_multitrack_playback_switching_via_state(
+    path: &str,
+    expected_tracks: usize,
+    first_switch: usize,
+    first_codec: &str,
+    second_switch: usize,
+    second_codec: &str,
+) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         "Test App".to_string(),
     )));
 
-    let handle_res = audio::start_audio_thread(test_file, false, shared_state.clone());
-    assert!(
-        handle_res.is_ok(),
-        "Failed to start audio thread: {:?}",
-        handle_res.err()
-    );
-    let _handle = handle_res.unwrap();
+    let _handle = audio::start_audio_thread(path, false, shared_state.clone())
+        .unwrap_or_else(|e| panic!("Failed to start audio thread for {path}: {e:?}"));
 
-    // Give the thread a moment to start and populate state
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    {
+    let mut populated = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        assert_eq!(
-            state.audio_tracks.len(),
-            4,
-            "State should have 4 audio tracks"
-        );
-        println!("Initial selected track: {}", state.selected_audio_track);
+        if state.audio_tracks.len() == expected_tracks {
+            populated = true;
+            break;
+        }
     }
+    assert!(
+        populated,
+        "State should have {expected_tracks} audio tracks for {path}"
+    );
 
-    // Request switch to track 2 (E-AC3)
     {
         let mut state = shared_state.lock().unwrap();
-        state.audio_track_request = Some(2);
+        state.audio_track_request = Some(first_switch);
     }
 
-    // Wait for the decoder thread to process the request
     let mut switched = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        if state.selected_audio_track == 2 {
+        if state.selected_audio_track == first_switch {
             switched = true;
-            assert_eq!(state.module_type, "E-AC3");
+            assert_eq!(state.module_type, first_codec);
             break;
         }
     }
     assert!(
         switched,
-        "Decoder thread did not switch to audio track 2 in time"
+        "Decoder thread did not switch to audio track {first_switch} in time"
     );
 
-    // Request switch back to track 0 (TrueHD)
     {
         let mut state = shared_state.lock().unwrap();
-        state.audio_track_request = Some(0);
+        state.audio_track_request = Some(second_switch);
     }
 
     let mut switched_back = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        if state.selected_audio_track == 0 {
+        if state.selected_audio_track == second_switch {
             switched_back = true;
-            assert_eq!(state.module_type, "TrueHD");
+            assert_eq!(state.module_type, second_codec);
             break;
         }
     }
     assert!(
         switched_back,
-        "Decoder thread did not switch back to audio track 0 in time"
+        "Decoder thread did not switch back to audio track {second_switch} in time"
     );
 }
 
 #[test]
-fn test_singletrack_no_op_and_position_preservation() {
-    let test_file = "audio_tests/FLAC 5.1.flac";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", test_file);
-        return;
+fn test_multitrack_playback_switching_via_state() {
+    let dir = common::TempTestDir::new("multitrack_state");
+    let synth_mkv = dir.path().join("synthetic_multitrack.mkv");
+    common::encode_synthetic_multitrack_mkv(&synth_mkv, 5.0)
+        .expect("encode synthetic multitrack MKV");
+    verify_multitrack_playback_switching_via_state(
+        synth_mkv.to_str().unwrap(),
+        3,
+        1,
+        "E-AC3",
+        0,
+        "AC3",
+    );
+
+    let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
+    if std::path::Path::new(test_file).exists() {
+        verify_multitrack_playback_switching_via_state(test_file, 4, 2, "E-AC3", 0, "TrueHD");
     }
+}
+
+fn verify_singletrack_no_op(path: &str) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         "Test App".to_string(),
     )));
 
-    let _handle = audio::start_audio_thread(test_file, false, shared_state.clone())
+    let _handle = audio::start_audio_thread(path, false, shared_state.clone())
         .expect("Failed to start audio thread");
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    {
+    let mut ready = false;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        assert_eq!(
-            state.audio_tracks.len(),
-            1,
-            "Single-stream file should have exactly 1 track"
-        );
-        assert_eq!(state.selected_audio_track, 0);
+        if !state.audio_tracks.is_empty() {
+            ready = true;
+            assert_eq!(
+                state.audio_tracks.len(),
+                1,
+                "Single-stream file should have exactly 1 track"
+            );
+            assert_eq!(state.selected_audio_track, 0);
+            break;
+        }
     }
+    assert!(
+        ready,
+        "Timed out waiting for singletrack metadata on {path}"
+    );
 
-    // Setting audio_track_request on single track should be ignored and not advance seek_epoch
     let initial_epoch = {
         let mut state = shared_state.lock().unwrap();
         state.audio_track_request = Some(0);
         state.seek_epoch
     };
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(120));
 
     {
         let state = shared_state.lock().unwrap();
@@ -180,30 +187,28 @@ fn test_singletrack_no_op_and_position_preservation() {
 }
 
 #[test]
-fn test_multitrack_mixing_and_volume_blending() {
-    let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: test file {} does not exist", test_file);
-        return;
+fn test_singletrack_no_op_and_position_preservation() {
+    let dir = common::TempTestDir::new("singletrack_noop");
+    let synth_flac = dir.path().join("synthetic_51.flac");
+    common::encode_synthetic_flac(&synth_flac, 6, 48_000, 3.0).expect("encode synthetic 5.1 FLAC");
+    verify_singletrack_no_op(synth_flac.to_str().unwrap());
+
+    let test_file = "audio_tests/FLAC 5.1.flac";
+    if std::path::Path::new(test_file).exists() {
+        verify_singletrack_no_op(test_file);
     }
-    let source_res = audio::load_audio_source(test_file);
-    assert!(
-        source_res.is_ok(),
-        "Failed to load test MKV: {:?}",
-        source_res.err()
-    );
-    let mut source = source_res.unwrap();
+}
+
+fn verify_multitrack_mixing(path: &str) {
+    let mut source =
+        audio::load_audio_source(path).unwrap_or_else(|e| panic!("Failed to load {path}: {e:?}"));
 
     let tracks = source.get_audio_tracks();
     assert!(tracks.len() >= 2, "Test requires at least 2 tracks");
 
-    // Mix Track 0 and Track 1 with equal volume
-    let mix_res = source.set_active_audio_tracks(&[(0, 1.0), (1, 1.0)]);
-    assert!(
-        mix_res.is_ok(),
-        "Failed to set active audio tracks: {:?}",
-        mix_res.err()
-    );
+    source
+        .set_active_audio_tracks(&[(0, 1.0), (1, 1.0)])
+        .expect("Failed to set active audio tracks");
 
     let active_tracks = source.get_active_audio_tracks();
     assert_eq!(active_tracks.len(), 2, "Should have 2 active tracks");
@@ -212,12 +217,11 @@ fn test_multitrack_mixing_and_volume_blending() {
 
     let mut buffer = vec![0.0f32; 1024 * 2];
     let frames = source.read_frames(2, 48000, &mut buffer);
-    println!("Read {} mixed frames", frames);
     assert!(frames > 0, "Failed to read frames from mixed streams");
 
-    // Adjust volume (mute track 1, keep track 0)
-    let adjust_res = source.set_active_audio_tracks(&[(0, 1.0), (1, 0.0)]);
-    assert!(adjust_res.is_ok(), "Failed to adjust track volumes");
+    source
+        .set_active_audio_tracks(&[(0, 1.0), (1, 0.0)])
+        .expect("Failed to adjust track volumes");
 
     let frames_after_adjust = source.read_frames(2, 48000, &mut buffer);
     assert!(
@@ -227,12 +231,20 @@ fn test_multitrack_mixing_and_volume_blending() {
 }
 
 #[test]
-fn test_multitrack_waveform_timeline_on_track_switch() {
+fn test_multitrack_mixing_and_volume_blending() {
+    let dir = common::TempTestDir::new("multitrack_mix");
+    let synth_mkv = dir.path().join("synthetic_multitrack.mkv");
+    common::encode_synthetic_multitrack_mkv(&synth_mkv, 2.0)
+        .expect("encode synthetic multitrack MKV");
+    verify_multitrack_mixing(synth_mkv.to_str().unwrap());
+
     let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: test file {} does not exist", test_file);
-        return;
+    if std::path::Path::new(test_file).exists() {
+        verify_multitrack_mixing(test_file);
     }
+}
+
+fn verify_multitrack_waveform_timeline_on_track_switch(path: &str, switch_track: usize) {
     let shared_state = std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(
         "Test App".to_string(),
     )));
@@ -241,24 +253,29 @@ fn test_multitrack_waveform_timeline_on_track_switch() {
         state.is_paused = false;
     }
 
-    let handle_res = audio::start_audio_thread(test_file, false, shared_state.clone());
+    let _handle = audio::start_audio_thread(path, false, shared_state.clone())
+        .unwrap_or_else(|e| panic!("Failed to start audio thread for {path}: {e:?}"));
+
+    let mut populated = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let state = shared_state.lock().unwrap();
+        let max_amp = state
+            .lookahead_timeline
+            .iter()
+            .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+        if !state.lookahead_queue.is_empty() && max_amp > 0.0 {
+            populated = true;
+            break;
+        }
+    }
     assert!(
-        handle_res.is_ok(),
-        "Failed to start audio thread: {:?}",
-        handle_res.err()
+        populated,
+        "Lookahead queue/timeline must populate initially for {path}"
     );
-    let _handle = handle_res.unwrap();
 
-    // Allow initial playback to decode and push lookahead slices
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Verify initial timeline has waveform data and queue is monotonic
     {
         let state = shared_state.lock().unwrap();
-        assert!(
-            !state.lookahead_queue.is_empty(),
-            "Lookahead queue should be populated initially"
-        );
         let mut prev_t = -1.0;
         for (t, _) in state.lookahead_queue.iter() {
             assert!(
@@ -269,47 +286,36 @@ fn test_multitrack_waveform_timeline_on_track_switch() {
             );
             prev_t = *t;
         }
-        let max_amp = state
-            .lookahead_timeline
-            .iter()
-            .fold(0.0f32, |acc, &v| acc.max(v.abs()));
-        assert!(
-            max_amp > 0.0,
-            "Initial lookahead timeline must contain non-zero audio waveform data"
-        );
     }
 
-    // Switch to Track 2 (E-AC3)
     {
         let mut state = shared_state.lock().unwrap();
-        state.audio_track_request = Some(2);
+        state.audio_track_request = Some(switch_track);
     }
 
-    let mut switched_to_2 = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut switched = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        if state.selected_audio_track == 2 {
-            switched_to_2 = true;
+        if state.selected_audio_track == switch_track {
+            switched = true;
             break;
         }
     }
-    assert!(switched_to_2, "Failed to switch to track 2");
+    assert!(switched, "Failed to switch to track {switch_track}");
 
-    // Allow decoder and DSP thread to process Track 2
-    std::thread::sleep(std::time::Duration::from_millis(400));
-
+    std::thread::sleep(std::time::Duration::from_millis(350));
     {
         let state = shared_state.lock().unwrap();
         assert!(
             !state.lookahead_queue.is_empty(),
-            "Lookahead queue should be populated on track 2"
+            "Lookahead queue should be populated on switched track"
         );
         let mut prev_t = -1.0;
         for (t, _) in state.lookahead_queue.iter() {
             assert!(
                 *t > prev_t,
-                "Lookahead queue timestamps must be strictly monotonic on track 2: {} <= {}",
+                "Lookahead queue timestamps must be strictly monotonic on track {switch_track}: {} <= {}",
                 *t,
                 prev_t
             );
@@ -317,54 +323,62 @@ fn test_multitrack_waveform_timeline_on_track_switch() {
         }
     }
 
-    // Switch back to Track 0 (Track 1)
     {
         let mut state = shared_state.lock().unwrap();
         state.audio_track_request = Some(0);
     }
 
-    let mut switched_back_to_0 = false;
-    for _ in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut switched_back = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
         if state.selected_audio_track == 0 {
-            switched_back_to_0 = true;
+            switched_back = true;
             break;
         }
     }
-    assert!(switched_back_to_0, "Failed to switch back to track 0");
+    assert!(switched_back, "Failed to switch back to track 0");
 
-    // Allow decoder and DSP thread to populate lookahead slices after switching back
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    {
+    let mut back_populated = false;
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let state = shared_state.lock().unwrap();
-        assert!(
-            !state.lookahead_queue.is_empty(),
-            "Lookahead queue must be populated after switching back to track 0"
-        );
-        let mut prev_t = -1.0;
-        for (t, _) in state.lookahead_queue.iter() {
-            assert!(
-                *t > prev_t,
-                "Lookahead queue timestamps must be strictly monotonic after switching back: {} <= {}",
-                *t,
-                prev_t
-            );
-            prev_t = *t;
-        }
         let max_amp = state
             .lookahead_timeline
             .iter()
             .fold(0.0f32, |acc, &v| acc.max(v.abs()));
-        println!(
-            "Track 0 after switch-back max timeline amplitude: {}",
-            max_amp
-        );
-        assert!(
-            max_amp > 0.0,
-            "Timeline must contain non-zero audio waveform data (no flatline!)"
-        );
+        if !state.lookahead_queue.is_empty() && max_amp > 0.0 {
+            back_populated = true;
+            let mut prev_t = -1.0;
+            for (t, _) in state.lookahead_queue.iter() {
+                assert!(
+                    *t > prev_t,
+                    "Lookahead queue timestamps must be strictly monotonic after switch-back: {} <= {}",
+                    *t,
+                    prev_t
+                );
+                prev_t = *t;
+            }
+            break;
+        }
+    }
+    assert!(
+        back_populated,
+        "Timeline must contain non-zero audio waveform data after switch-back"
+    );
+}
+
+#[test]
+fn test_multitrack_waveform_timeline_on_track_switch() {
+    let dir = common::TempTestDir::new("multitrack_timeline");
+    let synth_mkv = dir.path().join("synthetic_multitrack.mkv");
+    common::encode_synthetic_multitrack_mkv(&synth_mkv, 6.0)
+        .expect("encode synthetic multitrack MKV");
+    verify_multitrack_waveform_timeline_on_track_switch(synth_mkv.to_str().unwrap(), 1);
+
+    let test_file = "audio_tests/Dolby Atmos TrueHD, E-AC-3 7.1.4.mkv";
+    if std::path::Path::new(test_file).exists() {
+        verify_multitrack_waveform_timeline_on_track_switch(test_file, 2);
     }
 }
 
@@ -423,16 +437,10 @@ fn test_itu_bs775_downmix_all_channel_layouts() {
     assert!(m8 > 0.0, "Expected non-zero 7.1 mono downmix");
 }
 
-#[test]
-fn test_symphonia_7_1_flac_decoding_and_seeking() {
-    let test_file = "audio_tests/FLAC 7.1.flac";
-    if !std::path::Path::new(test_file).exists() {
-        eprintln!("Skipping test: fixture {} does not exist", test_file);
-        return;
-    }
-    let file = std::fs::File::open(test_file).expect("Failed to open FLAC 7.1.flac");
-    let mut sym = audio::try_symphonia(file, "flac", "flac", None, Some(test_file))
-        .expect("Symphonia must decode 7.1 FLAC");
+fn verify_symphonia_7_1_flac_decoding_and_seeking(path: &str) {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("Failed to open {path}: {e}"));
+    let mut sym = audio::try_symphonia(file, "flac", "flac", None, Some(path))
+        .unwrap_or_else(|e| panic!("Symphonia must decode 7.1 FLAC {path}: {e}"));
 
     assert_eq!(sym.get_num_channels(), 8, "Expected 8 channels in 7.1 FLAC");
     assert!(sym.get_duration_seconds() > 1.0);
@@ -456,4 +464,17 @@ fn test_symphonia_7_1_flac_decoding_and_seeking() {
         max_ch_vu > 0.0,
         "Expected non-zero per-channel VU on 7.1 FLAC"
     );
+}
+
+#[test]
+fn test_symphonia_7_1_flac_decoding_and_seeking() {
+    let dir = common::TempTestDir::new("symphonia_71_flac");
+    let synth_flac = dir.path().join("synthetic_71.flac");
+    common::encode_synthetic_flac(&synth_flac, 8, 48_000, 2.5).expect("encode synthetic 7.1 FLAC");
+    verify_symphonia_7_1_flac_decoding_and_seeking(synth_flac.to_str().unwrap());
+
+    let test_file = "audio_tests/FLAC 7.1.flac";
+    if std::path::Path::new(test_file).exists() {
+        verify_symphonia_7_1_flac_decoding_and_seeking(test_file);
+    }
 }
