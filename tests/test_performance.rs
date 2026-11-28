@@ -4991,21 +4991,38 @@ fn test_flip_disc_compute_and_render_verification() {
         }
 
         let cases = [
-            (1280u32, 720u32, true, "flip_disc_16x9.png"),
-            (1400u32, 400u32, true, "flip_disc_ultrawide.png"),
-            (540u32, 960u32, true, "flip_disc_portrait.png"),
-            (1280u32, 720u32, false, "flip_disc_quiet_16x9.png"),
+            (1280u32, 720u32, true, crate::state::FlipDiscMode::Ripples, "flip_disc_16x9.png"),
+            (1400u32, 400u32, true, crate::state::FlipDiscMode::Ripples, "flip_disc_ultrawide.png"),
+            (540u32, 960u32, true, crate::state::FlipDiscMode::Ripples, "flip_disc_portrait.png"),
+            (1280u32, 720u32, false, crate::state::FlipDiscMode::Ripples, "flip_disc_quiet_16x9.png"),
+            (1280u32, 720u32, true, crate::state::FlipDiscMode::Flocking, "flip_disc_flocking_16x9.png"),
+            (1280u32, 720u32, false, crate::state::FlipDiscMode::Flocking, "flip_disc_flocking_quiet_16x9.png"),
+            (1280u32, 720u32, true, crate::state::FlipDiscMode::SonarSweep, "flip_disc_sonar_16x9.png"),
+            (1280u32, 720u32, false, crate::state::FlipDiscMode::SonarSweep, "flip_disc_sonar_quiet_16x9.png"),
+            (1280u32, 720u32, true, crate::state::FlipDiscMode::MechanicalGravity, "flip_disc_gravity_16x9.png"),
+            (1280u32, 720u32, false, crate::state::FlipDiscMode::MechanicalGravity, "flip_disc_gravity_quiet_16x9.png"),
+            (1280u32, 720u32, true, crate::state::FlipDiscMode::KineticRain, "flip_disc_rain_16x9.png"),
+            (1280u32, 720u32, false, crate::state::FlipDiscMode::KineticRain, "flip_disc_rain_quiet_16x9.png"),
         ];
 
         let mut loud_16x9_rgba: Option<Vec<u8>> = None;
         let mut quiet_16x9_rgba: Option<Vec<u8>> = None;
 
-        for (w, h, loud, filename) in cases {
+        for (w, h, loud, mode, filename) in cases {
             let aspect = w as f32 / h as f32;
             let mut sim = engine::FlipDiscSimState::default();
             let mut ping = true;
             let mut initialized = false;
-            let steps = if loud { 36 } else { 48 };
+            let steps = if !loud {
+                48
+            } else if matches!(
+                mode,
+                crate::state::FlipDiscMode::SonarSweep | crate::state::FlipDiscMode::KineticRain
+            ) {
+                64
+            } else {
+                40
+            };
 
             for frame in 0..steps {
                 let t = (frame as f32) * (1.0 / 60.0);
@@ -5036,7 +5053,7 @@ fn test_flip_disc_compute_and_render_verification() {
                 }
 
                 let (fd_params, substeps) =
-                    sim.step(&spec, &vus, 1.0 / 60.0, aspect, true, t, initialized);
+                    sim.step(&spec, &vus, 1.0 / 60.0, aspect, true, t, initialized, mode);
                 queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&[fd_params]));
 
                 let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
@@ -5429,6 +5446,664 @@ fn test_flip_disc_compute_and_render_verification() {
         assert!(
             !error_caught.load(std::sync::atomic::Ordering::SeqCst),
             "WGPU validation error was triggered during Flip-Disc test!"
+        );
+    });
+}
+
+#[test]
+fn test_synthwave_racer_cameras_and_lighting() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+
+        let adapter = match instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => {
+                println!("Skipping Synthwave Racer GPU test: No GPU adapter available.");
+                return;
+            }
+        };
+
+        let timestamp_supported = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let req_features = if timestamp_supported {
+            Features::TIMESTAMP_QUERY
+        } else {
+            Features::empty()
+        };
+
+        let (device, queue) = match adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Synthwave Racer Test Device"),
+                required_features: req_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(dq) => dq,
+            Err(e) => {
+                println!("Skipping Synthwave Racer GPU test: Failed to request device: {e:?}");
+                return;
+            }
+        };
+
+        let error_caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err_clone = error_caught.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |err| {
+            eprintln!("WGPU uncaptured error in Synthwave Racer test: {err:?}");
+            err_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let color_format = TextureFormat::Rgba8UnormSrgb;
+        let sky_src =
+            resolve_shader_includes(include_str!("../src/shaders/vis_synthwave_racer_sky.wgsl"));
+        let scene_src =
+            resolve_shader_includes(include_str!("../src/shaders/vis_synthwave_racer_3d.wgsl"));
+
+        let sky_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Synthwave Sky Test Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&sky_src)),
+        });
+        let scene_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Synthwave 3D Test Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&scene_src)),
+        });
+
+        let audio_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Synthwave Racer Audio BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let cam_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Synthwave Racer Cam BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Synthwave Racer Audio Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cam_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Synthwave Racer Camera Uniforms"),
+            size: std::mem::size_of::<engine::CameraUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let history_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Synthwave Racer Dummy History"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let history_view = history_tex.create_view(&TextureViewDescriptor::default());
+
+        let audio_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Synthwave Racer Audio BG"),
+            layout: &audio_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(&history_view),
+                },
+            ],
+        });
+        let cam_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Synthwave Racer Cam BG"),
+            layout: &cam_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: cam_buf.as_entire_binding(),
+            }],
+        });
+
+        let layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Synthwave Racer Test Pipeline Layout"),
+            bind_group_layouts: &[Some(&audio_bgl), Some(&cam_bgl)],
+            immediate_size: 0,
+        });
+
+        let sky_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Synthwave Sky Test Pipeline"),
+            layout: Some(&layout_3d),
+            vertex: VertexState {
+                module: &sky_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &sky_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::Always),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let vertex_buffers = [Some(engine::Vertex::desc())];
+        let scene_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Synthwave 3D Test Pipeline"),
+            layout: Some(&layout_3d),
+            vertex: VertexState {
+                module: &scene_mod,
+                entry_point: Some("vs_main_3d"),
+                buffers: &vertex_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &scene_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let (verts, inds) = engine::generate_synthwave_racer_mesh();
+        let vbuf = device.create_buffer(&BufferDescriptor {
+            label: Some("Synthwave Racer Vertices"),
+            size: (verts.len() * std::mem::size_of::<engine::Vertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&verts));
+        let ibuf = device.create_buffer(&BufferDescriptor {
+            label: Some("Synthwave Racer Indices"),
+            size: (inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&ibuf, 0, bytemuck::cast_slice(&inds));
+        let idx_count = inds.len() as u32;
+
+        let snapshot_dir = std::env::var("RT_SAVE_RACER_SNAPSHOT_DIR").ok();
+        if let Some(dir) = &snapshot_dir {
+            std::fs::create_dir_all(dir).expect("Failed to create racer snapshot dir");
+        }
+
+        let smooth_time = 2.6_f32;
+        let cases = [
+            (1280u32, 720u32, state::SynthwaveRacerCamera::Chase, "racer_chase_16x9.png"),
+            (1280u32, 720u32, state::SynthwaveRacerCamera::HeroFront, "racer_hero_front_16x9.png"),
+            (1280u32, 720u32, state::SynthwaveRacerCamera::LowWheel, "racer_low_wheel_16x9.png"),
+            (1280u32, 720u32, state::SynthwaveRacerCamera::Hood, "racer_hood_16x9.png"),
+            (1280u32, 720u32, state::SynthwaveRacerCamera::Helicopter, "racer_helicopter_16x9.png"),
+            (1400u32, 400u32, state::SynthwaveRacerCamera::HeroFront, "racer_hero_front_ultrawide.png"),
+            (540u32, 960u32, state::SynthwaveRacerCamera::LowWheel, "racer_low_wheel_portrait.png"),
+        ];
+
+        let mut frame_16x9_images: Vec<(state::SynthwaveRacerCamera, Vec<u8>)> = Vec::new();
+
+        for (w, h, cam_mode, filename) in cases {
+            let aspect = w as f32 / h as f32;
+            let (eye, target, up, fov_deg) =
+                engine::compute_synthwave_racer_camera(smooth_time, aspect, cam_mode);
+            let base_fov = fov_deg.to_radians();
+            let fov_y = if aspect < 1.0 {
+                (base_fov / aspect.clamp(0.65, 1.0)).min(75.0_f32.to_radians())
+            } else {
+                base_fov
+            };
+            let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+            let view = glam::Mat4::look_at_rh(eye, target, up);
+
+            let mut u: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+            u.mode = 14;
+            u.num_channels = 2;
+            u.num_spatial_channels = 2;
+            u.time = smooth_time;
+            u.smooth_time = smooth_time;
+            u.frame_dt = 1.0 / 60.0;
+            u.aspect_ratio = aspect;
+            // Realistic synthwave bass + mid + treble spectrum energy
+            for (i, bin) in u.spectrum.iter_mut().enumerate() {
+                let x = i as f32;
+                *bin = if i < 16 {
+                    82.0 - x * 2.2
+                } else if i < 48 {
+                    44.0 + ((x * 0.4).sin() * 14.0)
+                } else {
+                    36.0 + ((x * 0.3).cos() * 16.0)
+                };
+            }
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+            let cu = engine::CameraUniforms {
+                view_matrix: view.to_cols_array_2d(),
+                proj_matrix: proj.to_cols_array_2d(),
+            };
+            queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cu]));
+
+            let color_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Synthwave Racer Color"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: color_format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+            let depth_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Synthwave Racer Depth"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Depth32Float,
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+
+            let padded_row_bytes = (w * 4).div_ceil(256) * 256;
+            let readback_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Synthwave Racer Readback"),
+                size: (padded_row_bytes * h) as u64,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Synthwave Racer Test Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color {
+                                r: 0.0,
+                                g: 1.0,
+                                b: 0.0,
+                                a: 1.0,
+                            }),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&sky_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &cam_bg, &[]);
+                rp.draw(0..3, 0..1);
+
+                rp.set_pipeline(&scene_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &cam_bg, &[]);
+                rp.set_vertex_buffer(0, vbuf.slice(..));
+                rp.set_index_buffer(ibuf.slice(..), IndexFormat::Uint32);
+                rp.draw_indexed(0..idx_count, 0, 0..1);
+            }
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &color_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(h),
+                    },
+                },
+                Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+
+            let slice = readback_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range().unwrap();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                let row_start = y * padded_row_bytes as usize;
+                rgba.extend_from_slice(&mapped[row_start..row_start + (w * 4) as usize]);
+            }
+            drop(mapped);
+            readback_buf.unmap();
+
+            if let Some(dir) = &snapshot_dir {
+                let out_path = std::path::Path::new(dir).join(filename);
+                image::save_buffer(&out_path, &rgba, w, h, image::ColorType::Rgba8)
+                    .expect("Failed to save racer snapshot");
+            }
+
+            let total_px = (w * h) as usize;
+            let mut sentinel_leaks = 0usize;
+            let mut luma_sum = 0.0_f64;
+            let mut luma_sq_sum = 0.0_f64;
+            let mut warm_red_car_px = 0usize;
+            for px in rgba.as_chunks::<4>().0 {
+                let [r, g, b, _] = *px;
+                if r == 0 && g == 255 && b == 0 {
+                    sentinel_leaks += 1;
+                }
+                if r > 120 && r > g.saturating_add(50) && r > b.saturating_add(30) {
+                    warm_red_car_px += 1;
+                }
+                let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+                luma_sum += luma;
+                luma_sq_sum += luma * luma;
+            }
+            let mean_luma = luma_sum / total_px as f64;
+            let luma_std = (luma_sq_sum / total_px as f64 - mean_luma * mean_luma).max(0.0).sqrt();
+            println!(
+                "Racer {filename} ({w}x{h}): mean_luma={mean_luma:.4}, std={luma_std:.4}, warm_red={warm_red_car_px}, sentinel_leaks={sentinel_leaks}"
+            );
+            assert_eq!(sentinel_leaks, 0, "{filename} must have zero sky/gap sentinel leaks");
+            assert!(
+                luma_std > 0.05,
+                "{filename} rendered too flat (luma_std={luma_std:.4})"
+            );
+            if w == 1280 && h == 720 {
+                assert!(
+                    warm_red_car_px > 200,
+                    "{filename} should show lit red car bodywork / warm sunset scene"
+                );
+                frame_16x9_images.push((cam_mode, rgba));
+            }
+        }
+
+        // Verify every camera angle produces a genuinely distinct view
+        for i in 0..frame_16x9_images.len() {
+            for j in (i + 1)..frame_16x9_images.len() {
+                let (m1, ref img1) = frame_16x9_images[i];
+                let (m2, ref img2) = frame_16x9_images[j];
+                let diff: f64 = img1
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(img2.as_chunks::<4>().0.iter())
+                    .map(|(a, b)| {
+                        ((a[0] as f64 - b[0] as f64).abs()
+                            + (a[1] as f64 - b[1] as f64).abs()
+                            + (a[2] as f64 - b[2] as f64).abs())
+                            / 3.0
+                    })
+                    .sum::<f64>()
+                    / (img1.len() / 4) as f64;
+                assert!(
+                    diff > 15.0,
+                    "Cameras {m1:?} and {m2:?} rendered too similarly (diff={diff:.2})"
+                );
+            }
+        }
+
+        if timestamp_supported {
+            for (bw, bh, budget_ms, label) in [
+                (1280u32, 720u32, Some(0.700_f32), "1280x720"),
+                (1920u32, 1080u32, None, "1920x1080"),
+            ] {
+                let aspect = bw as f32 / bh as f32;
+                let (eye, target, up, fov_deg) = engine::compute_synthwave_racer_camera(
+                    smooth_time,
+                    aspect,
+                    state::SynthwaveRacerCamera::HeroFront,
+                );
+                let cu = engine::CameraUniforms {
+                    view_matrix: glam::Mat4::look_at_rh(eye, target, up).to_cols_array_2d(),
+                    proj_matrix: glam::Mat4::perspective_rh_gl(fov_deg.to_radians(), aspect, 0.1, 1000.0)
+                        .to_cols_array_2d(),
+                };
+                queue.write_buffer(&cam_buf, 0, bytemuck::cast_slice(&[cu]));
+
+                let color_tex = device.create_texture(&TextureDescriptor {
+                    label: Some("Racer Perf Color"),
+                    size: Extent3d {
+                        width: bw,
+                        height: bh,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: color_format,
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+                let depth_tex = device.create_texture(&TextureDescriptor {
+                    label: Some("Racer Perf Depth"),
+                    size: Extent3d {
+                        width: bw,
+                        height: bh,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Depth32Float,
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+
+                let qs = device.create_query_set(&QuerySetDescriptor {
+                    label: Some("Racer Perf QS"),
+                    ty: QueryType::Timestamp,
+                    count: 2,
+                });
+                let res_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Racer Perf Resolve"),
+                    size: 16,
+                    usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let ts_read_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Racer Perf Read"),
+                    size: 16,
+                    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let period = queue.get_timestamp_period();
+                let iters = 10;
+                let mut sum_ms = 0.0_f32;
+                for _ in 0..iters {
+                    let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                            label: Some("Racer Perf Pass"),
+                            color_attachments: &[Some(RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: Operations {
+                                    load: LoadOp::Clear(Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                                view: &depth_view,
+                                depth_ops: Some(Operations {
+                                    load: LoadOp::Clear(1.0),
+                                    store: StoreOp::Discard,
+                                }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: Some(RenderPassTimestampWrites {
+                                query_set: &qs,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        rp.set_pipeline(&sky_pipe);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.set_bind_group(1, &cam_bg, &[]);
+                        rp.draw(0..3, 0..1);
+
+                        rp.set_pipeline(&scene_pipe);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.set_bind_group(1, &cam_bg, &[]);
+                        rp.set_vertex_buffer(0, vbuf.slice(..));
+                        rp.set_index_buffer(ibuf.slice(..), IndexFormat::Uint32);
+                        rp.draw_indexed(0..idx_count, 0, 0..1);
+                    }
+                    enc.resolve_query_set(&qs, 0..2, &res_buf, 0);
+                    enc.copy_buffer_to_buffer(&res_buf, 0, &ts_read_buf, 0, 16);
+                    queue.submit(Some(enc.finish()));
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    let slice = ts_read_buf.slice(..);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    rx.recv().unwrap().unwrap();
+                    let data = slice.get_mapped_range().unwrap();
+                    let s = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    let e = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    drop(data);
+                    ts_read_buf.unmap();
+                    if e > s {
+                        sum_ms += ((e - s) as f32 * period) / 1_000_000.0;
+                    }
+                }
+                let avg_ms = sum_ms / iters as f32;
+                println!("Synthwave Racer {label} GPU 2-pass render: {avg_ms:.3} ms");
+                if let Some(limit) = budget_ms {
+                    assert!(
+                        avg_ms < limit,
+                        "Synthwave Racer {label} render exceeded {limit:.3}ms budget: {avg_ms:.3} ms"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !error_caught.load(std::sync::atomic::Ordering::SeqCst),
+            "WGPU validation error was triggered during Synthwave Racer test!"
         );
     });
 }

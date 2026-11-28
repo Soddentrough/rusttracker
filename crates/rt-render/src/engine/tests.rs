@@ -3307,7 +3307,27 @@ fn test_flip_disc_registration_sim_and_shaders() {
         "Mechanical Flip-Disc (ID 32) must be enabled by default"
     );
 
-    assert_eq!(std::mem::size_of::<FlipDiscParams>(), 96);
+    assert_eq!(std::mem::size_of::<FlipDiscParams>(), 1008);
+
+    // FlipDiscMode cycle & labels
+    let mut mode = crate::state::FlipDiscMode::Ripples;
+    let mut visited = Vec::new();
+    for _ in 0..5 {
+        visited.push(mode);
+        mode = mode.next();
+    }
+    assert_eq!(visited, crate::state::FlipDiscMode::ALL);
+    assert_eq!(mode, crate::state::FlipDiscMode::Ripples);
+    assert_eq!(crate::state::FlipDiscMode::Flocking.label(), "Flocking");
+    assert_eq!(crate::state::FlipDiscMode::SonarSweep.label(), "Sonar Sweep");
+    assert_eq!(
+        crate::state::FlipDiscMode::MechanicalGravity.label(),
+        "Mechanical Gravity"
+    );
+    assert_eq!(
+        crate::state::FlipDiscMode::KineticRain.label(),
+        "Kinetic Rain"
+    );
 
     // Silence & paused behavior
     let mut sim = FlipDiscSimState::default();
@@ -3321,6 +3341,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         false,
         1.0,
         false,
+        crate::state::FlipDiscMode::Ripples,
     );
     assert_eq!(sub_paused, 0);
     assert!(p_paused.impulses.iter().all(|imp| imp[3] == 0.0));
@@ -3333,6 +3354,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         true,
         1.0,
         false,
+        crate::state::FlipDiscMode::Ripples,
     );
     assert_eq!(sub_silent, 1);
     assert!(p_silent.impulses.iter().all(|imp| imp[3] == 0.0));
@@ -3348,6 +3370,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         true,
         2.0,
         true,
+        crate::state::FlipDiscMode::Ripples,
     );
     assert_eq!(sub_kick, 1);
     let kick_imp = p_kick.impulses[0];
@@ -3356,7 +3379,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         "Expected strong bass impulse, got {kick_imp:?}"
     );
     assert!(
-        (5.0..=91.0).contains(&kick_imp[0]) && (5.0..=59.0).contains(&kick_imp[1]),
+        (6.0..=122.0).contains(&kick_imp[0]) && (6.0..=90.0).contains(&kick_imp[1]),
         "Impulse out of safe grid interior: {kick_imp:?}"
     );
     let (p_next, _) = sim.step(
@@ -3367,6 +3390,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         true,
         2.016,
         true,
+        crate::state::FlipDiscMode::Ripples,
     );
     assert_eq!(
         p_next.impulses[0][3], 0.0,
@@ -3385,6 +3409,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         true,
         1.0,
         false,
+        crate::state::FlipDiscMode::Ripples,
     );
     let mut sim_r = FlipDiscSimState::default();
     let (p_right, _) = sim_r.step(
@@ -3395,6 +3420,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
         true,
         1.0,
         false,
+        crate::state::FlipDiscMode::Ripples,
     );
     assert!(
         p_right.impulses[1][0] > p_left.impulses[1][0] + 6.0,
@@ -3415,6 +3441,7 @@ fn test_flip_disc_registration_sim_and_shaders() {
             true,
             i as f32 / 144.0,
             true,
+            crate::state::FlipDiscMode::Ripples,
         );
         total_144 += s;
     }
@@ -3429,12 +3456,103 @@ fn test_flip_disc_registration_sim_and_shaders() {
             true,
             i as f32 / 60.0,
             true,
+            crate::state::FlipDiscMode::Ripples,
         );
         total_60 += s;
     }
     assert!(
         (58..=61).contains(&total_144) && (59..=61).contains(&total_60),
         "Fixed-60Hz accumulator must produce ~60 substeps/sec at any FPS (144Hz={total_144}, 60Hz={total_60})"
+    );
+
+    // Mode transition reset flag & active vs silent checks for the 4 alternative modes
+    let mut loud_spec = vec![0.0f32; 1024];
+    loud_spec[1..16].fill(78.0);
+    loud_spec[30..110].fill(68.0);
+    loud_spec[200..420].fill(58.0);
+
+    // Flocking
+    let (p_flock, s_flock) = sim.step(
+        &loud_spec,
+        &[0.8, 0.8],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.0,
+        true,
+        crate::state::FlipDiscMode::Flocking,
+    );
+    assert_eq!(s_flock, 1);
+    assert_eq!(p_flock.mode_info[3], 1.0, "Mode switch must raise reset_flag");
+    assert!(p_flock.agents.iter().all(|a| a[3] > 0.4));
+    let (p_flock_quiet, _) = sim.step(
+        &silent_spec,
+        &silent_vu,
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.02,
+        true,
+        crate::state::FlipDiscMode::Flocking,
+    );
+    assert_eq!(p_flock_quiet.mode_info[3], 0.0);
+    assert!(p_flock_quiet.agents.iter().all(|a| a[3] == 0.0));
+
+    // SonarSweep
+    let (p_sonar1, _) = sim.step(
+        &loud_spec,
+        &[0.8, 0.8],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.1,
+        true,
+        crate::state::FlipDiscMode::SonarSweep,
+    );
+    assert_eq!(p_sonar1.mode_info[3], 1.0);
+    let (p_sonar2, _) = sim.step(
+        &loud_spec,
+        &[0.8, 0.8],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.12,
+        true,
+        crate::state::FlipDiscMode::SonarSweep,
+    );
+    assert!(p_sonar2.impulses[0][2] > 0.0, "Sonar beam must advance");
+    assert_ne!(p_sonar2.impulses[0][1], p_sonar1.impulses[0][1]);
+
+    // MechanicalGravity
+    let (p_grav, _) = sim.step(
+        &loud_spec,
+        &[0.8, 0.8],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.2,
+        true,
+        crate::state::FlipDiscMode::MechanicalGravity,
+    );
+    assert_eq!(p_grav.mode_info[3], 1.0);
+    assert!(p_grav.bands.iter().flatten().any(|&v| v > 0.1));
+    assert!(p_grav.peaks.iter().flatten().any(|&v| v > 0.1));
+
+    // KineticRain
+    let (p_rain, _) = sim.step(
+        &loud_spec,
+        &[0.8, 0.8],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.3,
+        true,
+        crate::state::FlipDiscMode::KineticRain,
+    );
+    assert_eq!(p_rain.mode_info[3], 1.0);
+    assert!(
+        p_rain.agents.iter().any(|a| a[3] > 0.5),
+        "Loud audio must spawn active falling raindrops"
     );
 
     // Naga parse and Capabilities::empty() validation for compute + render shaders
@@ -3502,5 +3620,148 @@ fn test_procedural_mesh_generators_bounds_and_finiteness() {
     ] {
         let (lv, li) = generate_glass_lyrics_mesh(text);
         assert_valid_mesh(label, &lv, &li);
+    }
+}
+
+#[test]
+fn test_synthwave_racer_cameras_and_mesh() {
+    use crate::engine::meshes::generate_synthwave_racer_mesh;
+    use crate::engine::types::{compute_synthwave_racer_camera, synthwave_racer_car_sway};
+    use crate::state::SynthwaveRacerCamera;
+
+    // 1. Enum cycling & labels
+    let mut cam = SynthwaveRacerCamera::Chase;
+    let mut labels = Vec::new();
+    for _ in 0..SynthwaveRacerCamera::ALL.len() {
+        labels.push(cam.label());
+        cam = cam.next();
+    }
+    assert_eq!(cam, SynthwaveRacerCamera::Chase);
+    assert_eq!(
+        labels,
+        vec![
+            "Chase Cam",
+            "Hero Front 3/4",
+            "Low Wheel-Well",
+            "Hood / Driver",
+            "Helicopter Orbit",
+        ]
+    );
+
+    // 2. Camera framing stability across 16:9, ultrawide, and portrait aspects
+    let (sway, _) = synthwave_racer_car_sway(3.2);
+    for &aspect in &[16.0_f32 / 9.0, 21.0 / 9.0, 0.60] {
+        let mut eyes = Vec::new();
+        for &mode in &SynthwaveRacerCamera::ALL {
+            let (eye, target, up, fov_deg) = compute_synthwave_racer_camera(3.2, aspect, mode);
+            assert!(eye.is_finite() && target.is_finite() && up.is_finite());
+            assert!(fov_deg > 30.0 && fov_deg < 75.0);
+            assert!(
+                eye.y > 0.45,
+                "camera {mode:?} eye.y={} must stay well above asphalt",
+                eye.y
+            );
+            assert!(
+                (target - eye).length() > 1.0,
+                "camera {mode:?} eye/target too close"
+            );
+            assert!(
+                (eye.x - sway).abs() < 20.0,
+                "camera {mode:?} unexpectedly far from car"
+            );
+            eyes.push(eye);
+        }
+        // All 5 cameras must yield distinct eye positions
+        for i in 0..eyes.len() {
+            for j in (i + 1)..eyes.len() {
+                assert!(
+                    (eyes[i] - eyes[j]).length() > 0.8,
+                    "cameras {i} and {j} must be distinct at aspect {aspect}"
+                );
+            }
+        }
+    }
+
+    // 3. Mesh continuity, tire grounding, headlights & clean normals
+    let (verts, indices) = generate_synthwave_racer_mesh();
+    assert!(!verts.is_empty() && !indices.is_empty());
+    assert_eq!(indices.len() % 3, 0);
+    for &idx in &indices {
+        assert!((idx as usize) < verts.len());
+    }
+
+    let mut min_ocean_z = f32::MAX;
+    let mut max_ocean_z = f32::MIN;
+    let mut min_road_z = f32::MAX;
+    let mut max_road_z = f32::MIN;
+    let mut min_tire_y = f32::MAX;
+    let mut headlight_verts = 0usize;
+    let mut car_non_wheel_verts = 0usize;
+
+    for v in &verts {
+        for &c in v.position.iter().chain(v.normal.iter()) {
+            assert!(c.is_finite(), "Non-finite vertex attribute in racer mesh");
+        }
+        let mat = v.tex_coords[0];
+        if (mat - 0.5).abs() < 0.05 {
+            min_ocean_z = min_ocean_z.min(v.position[2]);
+            max_ocean_z = max_ocean_z.max(v.position[2]);
+            assert!(v.position[1] < 0.0, "Ocean must stay strictly below road");
+        } else if mat.abs() < 0.05 {
+            min_road_z = min_road_z.min(v.position[2]);
+            max_road_z = max_road_z.max(v.position[2]);
+        } else if (mat - 5.0).abs() < 0.05 {
+            headlight_verts += 1;
+        } else if (mat - 7.0).abs() < 0.05 {
+            min_tire_y = min_tire_y.min(v.position[1]);
+        } else if (2.5..=9.5).contains(&mat) && (mat - 7.5).abs() > 0.05 {
+            car_non_wheel_verts += 1;
+            let nlen = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();
+            assert!(
+                (nlen - 1.0).abs() < 1e-2,
+                "Non-wheel car normal must be unit length (got {nlen})"
+            );
+        }
+    }
+
+    assert!(
+        min_ocean_z <= -250.0 && max_ocean_z >= 400.0,
+        "Ocean plane must extend behind and ahead ({min_ocean_z}..{max_ocean_z})"
+    );
+    assert!(
+        min_road_z <= -175.0 && max_road_z >= 375.0,
+        "Highway must extend behind and ahead ({min_road_z}..{max_road_z})"
+    );
+    assert!(headlight_verts >= 24, "Missing front twin headlight geometry");
+    assert!(car_non_wheel_verts > 100);
+    assert!(
+        min_tire_y.abs() < 0.025,
+        "Lowest tire tread must sit flush near y=0.0 asphalt (got {min_tire_y})"
+    );
+
+    // 4. Naga parse & Capabilities::empty() validation for sky & 3D shaders
+    const SHADER_COMMON: &str = include_str!("../../../../src/shaders/_common.wgsl");
+    for (name, raw_src) in [
+        (
+            "vis_synthwave_racer_sky.wgsl",
+            include_str!("../../../../src/shaders/vis_synthwave_racer_sky.wgsl"),
+        ),
+        (
+            "vis_synthwave_racer_3d.wgsl",
+            include_str!("../../../../src/shaders/vis_synthwave_racer_3d.wgsl"),
+        ),
+    ] {
+        let resolved = raw_src.replace("// INCLUDE: common", SHADER_COMMON);
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        let module = frontend
+            .parse(&resolved)
+            .unwrap_or_else(|e| panic!("{name} parse error: {}", e.emit_to_string(&resolved)));
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} validation error: {e:?}"));
     }
 }

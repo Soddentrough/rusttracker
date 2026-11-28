@@ -313,6 +313,97 @@ pub const NEON_STUDIO_CAM_CYCLE_SECS: f64 = 54.0;
 pub const BIOLUM_PARTICLE_COUNT: u32 = 36_864;
 pub const BIOLUM_WORKGROUPS: u32 = 144;
 
+/// Computes lateral lane sway `(sway_x, roll_rad)` for Visualizer 14 (`Synthwave 3D Racer`).
+#[inline]
+pub fn synthwave_racer_car_sway(smooth_time: f32) -> (f32, f32) {
+    let phase = smooth_time * 0.45;
+    let sway = phase.sin() * 0.35 + (phase * 0.5).sin() * 0.15;
+    let roll = -phase.cos() * 0.065;
+    (sway, roll)
+}
+
+/// Computes `(eye, target, up, fov_deg)` for Visualizer 14 (`Synthwave 3D Racer`).
+pub fn compute_synthwave_racer_camera(
+    smooth_time: f32,
+    aspect: f32,
+    mode: crate::state::SynthwaveRacerCamera,
+) -> (glam::Vec3, glam::Vec3, glam::Vec3, f32) {
+    let t = if smooth_time.is_finite() {
+        smooth_time
+    } else {
+        0.0
+    };
+    let (sway, _roll) = synthwave_racer_car_sway(t);
+    let portrait_pull = if aspect < 1.0 {
+        ((1.0 - aspect) * 1.8).clamp(0.0, 0.9)
+    } else {
+        0.0
+    };
+
+    match mode {
+        crate::state::SynthwaveRacerCamera::Chase => {
+            let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
+            let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
+            (
+                glam::Vec3::new(sway * 0.25, cam_y, cam_z),
+                glam::Vec3::new(sway * 0.40, 0.95, 14.0),
+                glam::Vec3::Y,
+                48.0,
+            )
+        }
+        crate::state::SynthwaveRacerCamera::HeroFront => {
+            let bob = (t * 1.1).sin() * 0.025;
+            (
+                glam::Vec3::new(
+                    sway + 2.85 + portrait_pull * 0.75,
+                    1.04 + bob,
+                    9.45 + portrait_pull * 1.1,
+                ),
+                glam::Vec3::new(sway - 0.12, 0.60, 5.15),
+                glam::Vec3::Y,
+                44.0,
+            )
+        }
+        crate::state::SynthwaveRacerCamera::LowWheel => {
+            let bob = (t * 1.5).sin() * 0.015;
+            (
+                glam::Vec3::new(
+                    sway - 2.75 - portrait_pull * 0.75,
+                    0.56 + bob,
+                    7.95 + portrait_pull * 0.8,
+                ),
+                glam::Vec3::new(sway - 0.10, 0.48, 5.15),
+                glam::Vec3::Y,
+                48.0,
+            )
+        }
+        crate::state::SynthwaveRacerCamera::Hood => {
+            let vibration = (t * 2.4).sin() * 0.008;
+            (
+                glam::Vec3::new(sway * 0.96, 1.06 + vibration, 5.42),
+                glam::Vec3::new(sway * 0.65, 0.86, 24.0),
+                glam::Vec3::Y,
+                56.0,
+            )
+        }
+        crate::state::SynthwaveRacerCamera::Helicopter => {
+            let angle = t * 0.35;
+            let radius = 8.6 + portrait_pull * 2.2;
+            let height = 4.15 + (t * 0.25).sin() * 0.65;
+            (
+                glam::Vec3::new(
+                    sway + angle.sin() * radius,
+                    height,
+                    5.2 - angle.cos() * radius,
+                ),
+                glam::Vec3::new(sway, 0.62, 5.45),
+                glam::Vec3::Y,
+                50.0,
+            )
+        }
+    }
+}
+
 /// Computes the camera `(eye, target, up)` for Visualizer 20 (`Bioluminescent Waves`)
 /// in either Perspective Horizon mode (`top_down = false`) or Top-Down Aerial mode (`top_down = true`).
 pub fn compute_biolum_camera(

@@ -586,11 +586,15 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     let scale_factor = (win.scale_factor() as f32).max(1.0);
                     self.touch_controller.set_scale_factor(scale_factor);
                     let is_portrait = size.width < size.height;
-                    let split_ratio = self.app_state.lock().unwrap().panel_split_ratio;
+                    let (split_ratio, show_hud, state_has_video) = {
+                        let st = self.app_state.lock().unwrap();
+                        (st.panel_split_ratio, st.show_hud, st.has_video_stream)
+                    };
                     let min_h_px = 220.0 * scale_factor;
-                    let split_y = (size.height as f32 * split_ratio)
+                    let clamped_split_y = (size.height as f32 * split_ratio)
                         .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
-                    let has_video = self.app_state.lock().unwrap().has_video_stream
+                    let split_y = if show_hud { clamped_split_y } else { 0.0 };
+                    let has_video = state_has_video
                         || self
                             .engine
                             .as_ref()
@@ -1522,50 +1526,59 @@ impl AndroidRustTrackerApp {
             TouchGesture::BottomPaneSwipeUp => {
                 if state.video_mode == 3 {
                     state.video_mode = 0;
+                } else {
+                    state.cycle_visualizer_variant(true);
                 }
                 None
             }
             TouchGesture::BottomPaneSwipeDown => {
                 if state.video_mode == 3 {
                     state.video_mode = 0;
+                } else {
+                    state.cycle_visualizer_variant(false);
                 }
                 None
             }
-            // Vertical swipe in landscape: rotate full screen HUD overlays
+            // Vertical swipe in landscape: cycle active visualizer variant when supported,
+            // otherwise rotate full screen HUD overlays
             TouchGesture::LandscapeSwipeUp => {
-                state.mobile_hud_tab = state.mobile_hud_tab.next(has_video);
-                state.show_hud = true;
-                state.osd_text = Some(match state.mobile_hud_tab {
-                    crate::state::MobileHudTab::Channels => "Channels".to_string(),
-                    crate::state::MobileHudTab::Heatmap => {
-                        if state.lyrics.is_some() {
-                            "Lyrics".to_string()
-                        } else {
-                            "Heatmap".to_string()
+                if !state.cycle_visualizer_variant(true) {
+                    state.mobile_hud_tab = state.mobile_hud_tab.next(has_video);
+                    state.show_hud = true;
+                    state.osd_text = Some(match state.mobile_hud_tab {
+                        crate::state::MobileHudTab::Channels => "Channels".to_string(),
+                        crate::state::MobileHudTab::Heatmap => {
+                            if state.lyrics.is_some() {
+                                "Lyrics".to_string()
+                            } else {
+                                "Heatmap".to_string()
+                            }
                         }
-                    }
-                    crate::state::MobileHudTab::Info => "Track Info".to_string(),
-                    crate::state::MobileHudTab::Video => "Video Stream".to_string(),
-                });
-                state.osd_timer = 1.5;
+                        crate::state::MobileHudTab::Info => "Track Info".to_string(),
+                        crate::state::MobileHudTab::Video => "Video Stream".to_string(),
+                    });
+                    state.osd_timer = 1.5;
+                }
                 None
             }
             TouchGesture::LandscapeSwipeDown => {
-                state.mobile_hud_tab = state.mobile_hud_tab.prev(has_video);
-                state.show_hud = true;
-                state.osd_text = Some(match state.mobile_hud_tab {
-                    crate::state::MobileHudTab::Channels => "Channels".to_string(),
-                    crate::state::MobileHudTab::Heatmap => {
-                        if state.lyrics.is_some() {
-                            "Lyrics".to_string()
-                        } else {
-                            "Heatmap".to_string()
+                if !state.cycle_visualizer_variant(false) {
+                    state.mobile_hud_tab = state.mobile_hud_tab.prev(has_video);
+                    state.show_hud = true;
+                    state.osd_text = Some(match state.mobile_hud_tab {
+                        crate::state::MobileHudTab::Channels => "Channels".to_string(),
+                        crate::state::MobileHudTab::Heatmap => {
+                            if state.lyrics.is_some() {
+                                "Lyrics".to_string()
+                            } else {
+                                "Heatmap".to_string()
+                            }
                         }
-                    }
-                    crate::state::MobileHudTab::Info => "Track Info".to_string(),
-                    crate::state::MobileHudTab::Video => "Video Stream".to_string(),
-                });
-                state.osd_timer = 1.5;
+                        crate::state::MobileHudTab::Info => "Track Info".to_string(),
+                        crate::state::MobileHudTab::Video => "Video Stream".to_string(),
+                    });
+                    state.osd_timer = 1.5;
+                }
                 None
             }
             TouchGesture::SingleTap { x, y } => {

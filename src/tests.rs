@@ -1,9 +1,10 @@
 use super::{
     AppState, Args, KeyCode, Parser, advance_playlist_on_track_ended,
-    apply_gamepad_stick_panel_resize, apply_ipc_file_paths_to_state,
-    apply_picked_file_paths_to_state, clamp_panel_split_ratio, clamp_window_geometry_to_monitor,
-    extract_rusttracker_shortcut_appids, handle_tui_key_event, handle_tui_mouse_event,
-    provision_steam_shortcut_artwork_in_root, upsert_rusttracker_shortcut_in_vdf,
+    apply_gamepad_stick_panel_resize, apply_gamepad_stick_variant_cycle,
+    apply_ipc_file_paths_to_state, apply_picked_file_paths_to_state, clamp_panel_split_ratio,
+    clamp_window_geometry_to_monitor, extract_rusttracker_shortcut_appids, handle_tui_key_event,
+    handle_tui_mouse_event, provision_steam_shortcut_artwork_in_root,
+    upsert_rusttracker_shortcut_in_vdf,
 };
 use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -1799,4 +1800,150 @@ fn test_cli_matches_visualizer_spec_and_absolutize_ipc_paths() {
     assert_eq!(out[3], inputs[3]);
     assert_eq!(out[4], inputs[4]);
     assert_eq!(out[5], cwd.join("rel/sub/track.xm").to_string_lossy());
+}
+
+#[test]
+fn test_visualizer_variant_cycling_touch_and_controller_stick() {
+    use crate::state::{FlipDiscMode, SynthwaveRacerCamera};
+    use crate::touch::{TouchEvent, TouchGesture, TouchGestureController, TouchPhase};
+
+    let mut state = AppState::new("test.mod".to_string());
+
+    // 1. Unsupported visualizer returns false
+    state.visualizer_mode = 0;
+    assert!(!state.cycle_visualizer_variant(true));
+
+    // 2. Forward & backward Synthwave 3D Racer camera cycling (ID 14)
+    state.visualizer_mode = 14;
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
+    assert!(state.cycle_visualizer_variant(true));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::HeroFront);
+    assert!(state.cycle_visualizer_variant(false));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
+    assert!(state.cycle_visualizer_variant(false));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Helicopter);
+    assert_eq!(state.osd_text.as_deref(), Some("Camera: Helicopter Orbit"));
+
+    // 3. Forward & backward Flip-Disc pattern cycling (ID 32)
+    state.visualizer_mode = 32;
+    assert_eq!(state.flip_disc_mode, FlipDiscMode::Ripples);
+    assert!(state.cycle_visualizer_variant(false));
+    assert_eq!(state.flip_disc_mode, FlipDiscMode::KineticRain);
+    assert!(state.cycle_visualizer_variant(true));
+    assert_eq!(state.flip_disc_mode, FlipDiscMode::Ripples);
+
+    // 4. Binary toggle visualizers (IDs 20, 27, 31)
+    for (vis_id, expected_a, expected_b) in [
+        (20u32, "Camera: Top-down", "Camera: Perspective"),
+        (27u32, "Ferrofluid: Studio Pool", "Ferrofluid: Magnetic Core"),
+        (31u32, "💨 Smoke Volume: OFF", "💨 Smoke Volume: ON"),
+    ] {
+        state.visualizer_mode = vis_id;
+        assert!(state.cycle_visualizer_variant(true));
+        assert_eq!(state.osd_text.as_deref(), Some(expected_a));
+        assert!(state.cycle_visualizer_variant(false));
+        assert_eq!(state.osd_text.as_deref(), Some(expected_b));
+    }
+
+    // 5. Controller Right-Stick X edge-triggered cycling + re-arm + Y-dominant rejection
+    state.visualizer_mode = 14;
+    state.racer_camera = SynthwaveRacerCamera::Chase;
+    let mut armed = true;
+
+    // Below threshold: does not fire
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.45, 0.0, &mut armed));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
+
+    // Flick Right: advances once and disarms
+    assert!(apply_gamepad_stick_variant_cycle(&mut state, 0.85, 0.05, &mut armed));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::HeroFront);
+    assert!(!armed);
+
+    // Holding Right does not repeat
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.90, 0.0, &mut armed));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::HeroFront);
+
+    // Releasing near center re-arms
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.12, 0.0, &mut armed));
+    assert!(armed);
+
+    // Y-dominant diagonal deflection is ignored so panel split resize remains clean
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.70, 0.80, &mut armed));
+    assert!(armed);
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::HeroFront);
+
+    // Flick Left goes backward
+    assert!(apply_gamepad_stick_variant_cycle(&mut state, -0.85, 0.0, &mut armed));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
+    assert!(!armed);
+
+    // Returning to center + opening modal suppresses stick cycling
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.0, 0.0, &mut armed));
+    state.show_vis_picker = true;
+    assert!(!apply_gamepad_stick_variant_cycle(&mut state, 0.95, 0.0, &mut armed));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
+
+    // 6. Touch vertical swipe up/down on visualizer pane (and fullscreen portrait split_y = 0.0)
+    let mut touch = TouchGestureController::new();
+    let swipe_up = |ctrl: &mut TouchGestureController, split_y: f32| {
+        ctrl.handle_touch(
+            &TouchEvent {
+                id: 1,
+                phase: TouchPhase::Started,
+                x: 500.0,
+                y: 1600.0,
+            },
+            1080.0,
+            2400.0,
+            true,
+            split_y,
+        );
+        ctrl.handle_touch(
+            &TouchEvent {
+                id: 1,
+                phase: TouchPhase::Ended,
+                x: 505.0,
+                y: 1400.0,
+            },
+            1080.0,
+            2400.0,
+            true,
+            split_y,
+        )
+    };
+    let swipe_down = |ctrl: &mut TouchGestureController, split_y: f32| {
+        ctrl.handle_touch(
+            &TouchEvent {
+                id: 2,
+                phase: TouchPhase::Started,
+                x: 500.0,
+                y: 500.0,
+            },
+            1080.0,
+            2400.0,
+            true,
+            split_y,
+        );
+        ctrl.handle_touch(
+            &TouchEvent {
+                id: 2,
+                phase: TouchPhase::Ended,
+                x: 505.0,
+                y: 720.0,
+            },
+            1080.0,
+            2400.0,
+            true,
+            split_y,
+        )
+    };
+
+    assert_eq!(swipe_up(&mut touch, 1200.0), Some(TouchGesture::BottomPaneSwipeUp));
+    assert!(state.cycle_visualizer_variant(true));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::HeroFront);
+
+    // With HUD hidden (split_y = 0.0), upper-screen portrait swipe down also targets BottomPaneSwipeDown
+    assert_eq!(swipe_down(&mut touch, 0.0), Some(TouchGesture::BottomPaneSwipeDown));
+    assert!(state.cycle_visualizer_variant(false));
+    assert_eq!(state.racer_camera, SynthwaveRacerCamera::Chase);
 }

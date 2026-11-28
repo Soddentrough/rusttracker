@@ -241,6 +241,29 @@ pub(crate) fn apply_gamepad_stick_panel_resize(
     }
 }
 
+/// Edge-triggered horizontal Right-Stick cycling for visualizer cameras & pattern modes.
+/// Deflecting past +/-0.65 advances forward (Right) or backward (Left) once until the stick
+/// returns inside the 0.30 center zone.
+pub(crate) fn apply_gamepad_stick_variant_cycle(
+    state: &mut AppState,
+    right_stick_x: f32,
+    right_stick_y: f32,
+    armed: &mut bool,
+) -> bool {
+    if right_stick_x.abs() < 0.30 {
+        *armed = true;
+        return false;
+    }
+    if state.show_vis_picker || state.is_file_picker_open || state.is_url_dialog_open {
+        return false;
+    }
+    if *armed && right_stick_x.abs() >= 0.65 && right_stick_x.abs() > right_stick_y.abs() * 1.35 {
+        *armed = false;
+        return state.cycle_visualizer_variant(right_stick_x > 0.0);
+    }
+    false
+}
+
 fn clear_spectrum_history_in_place(state: &mut AppState) {
     if state.spectrum_history.len() == 120
         && state.spectrum_history.iter().all(|row| row.len() == 1024)
@@ -1311,7 +1334,9 @@ pub(crate) async fn run_gui(
     let mut frame_dt_idx = 0usize;
     let mut desktop_frame_count = 0u64;
     let mut frame_left_stick_y = 0.0f32;
+    let mut frame_right_stick_x = 0.0f32;
     let mut frame_right_stick_y = 0.0f32;
+    let mut gamepad_stick_x_armed = true;
     let mut frame_left_trigger = 0.0f32;
     let mut frame_right_trigger = 0.0f32;
     let mut redraw_requested = true;
@@ -1381,7 +1406,7 @@ pub(crate) async fn run_gui(
 
                     if let WindowEvent::Touch(touch) = event {
                         last_mouse_move = Instant::now();
-                        let (modal_open, already_touch_scrubbing, split_ratio) = {
+                        let (modal_open, already_touch_scrubbing, split_ratio, show_hud) = {
                             let st = app_state.lock().unwrap();
                             (
                                 st.is_url_dialog_open
@@ -1390,6 +1415,7 @@ pub(crate) async fn run_gui(
                                     || st.show_help,
                                 st.is_touch_scrubbing,
                                 st.panel_split_ratio,
+                                st.show_hud,
                             )
                         };
                         if modal_open
@@ -1405,8 +1431,9 @@ pub(crate) async fn run_gui(
                             touch_controller.set_scale_factor(scale_factor);
                             let is_portrait = size.width < size.height;
                             let min_h_px = 220.0 * scale_factor;
-                            let split_y = (size.height as f32 * split_ratio)
+                            let clamped_split_y = (size.height as f32 * split_ratio)
                                 .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
+                            let split_y = if show_hud { clamped_split_y } else { 0.0 };
                             let touch_ev = crate::engine::touch_event_from_winit(touch);
                             if let Some(gesture) = touch_controller.handle_touch(
                                 &touch_ev,
@@ -1416,6 +1443,22 @@ pub(crate) async fn run_gui(
                                 split_y,
                             ) {
                                 match gesture {
+                                    crate::touch::TouchGesture::BottomPaneSwipeUp
+                                    | crate::touch::TouchGesture::LandscapeSwipeUp => {
+                                        let mut st = app_state.lock().unwrap();
+                                        if st.cycle_visualizer_variant(true) {
+                                            window.request_redraw();
+                                            redraw_requested = true;
+                                        }
+                                    }
+                                    crate::touch::TouchGesture::BottomPaneSwipeDown
+                                    | crate::touch::TouchGesture::LandscapeSwipeDown => {
+                                        let mut st = app_state.lock().unwrap();
+                                        if st.cycle_visualizer_variant(false) {
+                                            window.request_redraw();
+                                            redraw_requested = true;
+                                        }
+                                    }
                                     crate::touch::TouchGesture::Scrub { pct } => {
                                         let mut st = app_state.lock().unwrap();
                                         let allow_live_seek = last_touch_scrub_seek.elapsed()
@@ -1814,36 +1857,7 @@ pub(crate) async fn run_gui(
                                         }
                                         WinitKeyCode::KeyC => {
                                             let mut state = app_state.lock().unwrap();
-                                            if state.visualizer_mode == 20 {
-                                                state.biolum_top_down = !state.biolum_top_down;
-                                                state.osd_text = Some(format!(
-                                                    "Camera: {}",
-                                                    if state.biolum_top_down {
-                                                        "Top-down"
-                                                    } else {
-                                                        "Perspective"
-                                                    }
-                                                ));
-                                                state.osd_timer = 2.0;
-                                            } else if state.visualizer_mode == 27 {
-                                                state.ferrofluid_pool_mode =
-                                                    !state.ferrofluid_pool_mode;
-                                                state.osd_text =
-                                                    Some(if state.ferrofluid_pool_mode {
-                                                        "Ferrofluid: Studio Pool".to_string()
-                                                    } else {
-                                                        "Ferrofluid: Magnetic Core".to_string()
-                                                    });
-                                                state.osd_timer = 2.0;
-                                            } else if state.visualizer_mode == 31 {
-                                                state.room_volume_smoke = !state.room_volume_smoke;
-                                                state.osd_text = Some(if state.room_volume_smoke {
-                                                    "💨 Smoke Volume: ON".to_string()
-                                                } else {
-                                                    "💨 Smoke Volume: OFF".to_string()
-                                                });
-                                                state.osd_timer = 2.0;
-                                            }
+                                            state.cycle_visualizer_variant(true);
                                         }
                                         WinitKeyCode::KeyS => {
                                             let mut state = app_state.lock().unwrap();
@@ -2664,8 +2678,9 @@ pub(crate) async fn run_gui(
                                     state.spectrum_history.push_back(recycled);
                                 }
 
-                                // Gamepad analog panel scaling (Left Stick Y or Right Stick Y) and trigger scrubbing
+                                // Gamepad analog panel scaling (Left/Right Stick Y), right-stick X variant cycling, and trigger scrubbing
                                 let mut max_left_y = std::mem::take(&mut frame_left_stick_y);
+                                let mut max_right_x = std::mem::take(&mut frame_right_stick_x);
                                 let mut max_right_y = std::mem::take(&mut frame_right_stick_y);
                                 let mut max_lt = std::mem::take(&mut frame_left_trigger);
                                 let mut max_rt = std::mem::take(&mut frame_right_trigger);
@@ -2677,6 +2692,10 @@ pub(crate) async fn run_gui(
                                         let left_y = gamepad.value(gilrs::Axis::LeftStickY);
                                         if left_y.abs() > max_left_y.abs() {
                                             max_left_y = left_y;
+                                        }
+                                        let right_x = gamepad.value(gilrs::Axis::RightStickX);
+                                        if right_x.abs() > max_right_x.abs() {
+                                            max_right_x = right_x;
                                         }
                                         let right_y = gamepad.value(gilrs::Axis::RightStickY);
                                         if right_y.abs() > max_right_y.abs() {
@@ -2712,11 +2731,24 @@ pub(crate) async fn run_gui(
                                         }
                                     }
                                 }
+                                let effective_right_y = if max_right_x.abs() >= 0.30
+                                    && max_right_x.abs() > max_right_y.abs() * 1.35
+                                {
+                                    0.0
+                                } else {
+                                    max_right_y
+                                };
+                                apply_gamepad_stick_variant_cycle(
+                                    &mut state,
+                                    max_right_x,
+                                    max_right_y,
+                                    &mut gamepad_stick_x_armed,
+                                );
                                 apply_gamepad_trigger_scrub(&mut state, max_lt, max_rt, dt);
                                 apply_gamepad_stick_panel_resize(
                                     &mut state,
                                     max_left_y,
-                                    max_right_y,
+                                    effective_right_y,
                                     dt,
                                 );
 
@@ -3551,7 +3583,9 @@ pub(crate) async fn run_gui(
                             // Unfocused: drain and discard events so other apps own the controller.
                             while gilrs.next_event().is_some() {}
                             frame_left_stick_y = 0.0;
+                            frame_right_stick_x = 0.0;
                             frame_right_stick_y = 0.0;
+                            gamepad_stick_x_armed = true;
                             frame_left_trigger = 0.0;
                             frame_right_trigger = 0.0;
                         }
@@ -3562,6 +3596,11 @@ pub(crate) async fn run_gui(
                                         if val.abs() > frame_left_stick_y.abs() =>
                                     {
                                         frame_left_stick_y = val;
+                                    }
+                                    gilrs::Axis::RightStickX
+                                        if val.abs() > frame_right_stick_x.abs() =>
+                                    {
+                                        frame_right_stick_x = val;
                                     }
                                     gilrs::Axis::RightStickY
                                         if val.abs() > frame_right_stick_y.abs() =>

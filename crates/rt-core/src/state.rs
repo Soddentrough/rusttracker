@@ -499,7 +499,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         id: 14,
         name: "Synthwave 3D Racer",
         filename: "vis_synthwave_racer_3d.wgsl",
-        description: "Multi-pass 3D low-poly sports car, highway & infinite horizon sky",
+        description: "Multi-pass 3D supercar, highway & sunset horizon sky ('c' cycles camera)",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::SynthwaveRacerScene,
             instances: 1,
@@ -634,7 +634,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         id: 32,
         name: "Mechanical Flip-Disc",
         filename: "vis_flip_disc.wgsl",
-        description: "Tactile charcoal-and-white mechanical flip-disc wall driven by audio ripples",
+        description: "Tactile charcoal-and-white mechanical flip-disc wall ('c' cycles pattern modes)",
         pipeline_type: PipelineType::FullscreenTriangle,
         requires_history: false,
         requires_fire: false,
@@ -644,6 +644,124 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         heavy_shader: false,
     },
 ];
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlipDiscMode {
+    #[default]
+    Ripples = 0,
+    Flocking = 1,
+    SonarSweep = 2,
+    MechanicalGravity = 3,
+    KineticRain = 4,
+}
+
+impl FlipDiscMode {
+    pub const ALL: [Self; 5] = [
+        Self::Ripples,
+        Self::Flocking,
+        Self::SonarSweep,
+        Self::MechanicalGravity,
+        Self::KineticRain,
+    ];
+
+    #[inline]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Ripples => Self::Flocking,
+            Self::Flocking => Self::SonarSweep,
+            Self::SonarSweep => Self::MechanicalGravity,
+            Self::MechanicalGravity => Self::KineticRain,
+            Self::KineticRain => Self::Ripples,
+        }
+    }
+
+    #[inline]
+    pub const fn prev(self) -> Self {
+        match self {
+            Self::Ripples => Self::KineticRain,
+            Self::Flocking => Self::Ripples,
+            Self::SonarSweep => Self::Flocking,
+            Self::MechanicalGravity => Self::SonarSweep,
+            Self::KineticRain => Self::MechanicalGravity,
+        }
+    }
+
+    #[inline]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ripples => "Ripples",
+            Self::Flocking => "Flocking",
+            Self::SonarSweep => "Sonar Sweep",
+            Self::MechanicalGravity => "Mechanical Gravity",
+            Self::KineticRain => "Kinetic Rain",
+        }
+    }
+}
+
+/// Camera viewpoints for Synthwave 3D Racer (Visualizer 14), cycled with `c`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SynthwaveRacerCamera {
+    /// Classic behind-the-car OutRun chase camera.
+    #[default]
+    Chase,
+    /// Low front three-quarter glamour shot tracking beside the nose.
+    HeroFront,
+    /// Dramatic close-up near the front-left wheel arch & side vent.
+    LowWheel,
+    /// Forward-looking hood/cockpit camera skimming over the pop-up cowls.
+    Hood,
+    /// High sweeping helicopter orbit circling the supercar at 360°.
+    Helicopter,
+}
+
+impl SynthwaveRacerCamera {
+    pub const ALL: [Self; 5] = [
+        Self::Chase,
+        Self::HeroFront,
+        Self::LowWheel,
+        Self::Hood,
+        Self::Helicopter,
+    ];
+
+    #[inline]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Chase => Self::HeroFront,
+            Self::HeroFront => Self::LowWheel,
+            Self::LowWheel => Self::Hood,
+            Self::Hood => Self::Helicopter,
+            Self::Helicopter => Self::Chase,
+        }
+    }
+
+    #[inline]
+    pub const fn prev(self) -> Self {
+        match self {
+            Self::Chase => Self::Helicopter,
+            Self::HeroFront => Self::Chase,
+            Self::LowWheel => Self::HeroFront,
+            Self::Hood => Self::LowWheel,
+            Self::Helicopter => Self::Hood,
+        }
+    }
+
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Chase => "Chase Cam",
+            Self::HeroFront => "Hero Front 3/4",
+            Self::LowWheel => "Low Wheel-Well",
+            Self::Hood => "Hood / Driver",
+            Self::Helicopter => "Helicopter Orbit",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AudioTrackInfo {
@@ -1196,6 +1314,8 @@ pub struct AppState {
     pub biolum_top_down: bool,
     pub room_volume_smoke: bool,
     pub ferrofluid_pool_mode: bool,
+    pub flip_disc_mode: FlipDiscMode,
+    pub racer_camera: SynthwaveRacerCamera,
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
     pub available_output_devices: Vec<String>,
@@ -1417,6 +1537,8 @@ impl AppState {
             biolum_top_down: false,
             room_volume_smoke: true,
             ferrofluid_pool_mode: false,
+            flip_disc_mode: FlipDiscMode::Ripples,
+            racer_camera: SynthwaveRacerCamera::Chase,
             selected_audio_device: default_audio_device,
             available_audio_devices,
             available_output_devices,
@@ -1584,6 +1706,8 @@ impl AppState {
             biolum_top_down,
             room_volume_smoke,
             ferrofluid_pool_mode,
+            flip_disc_mode,
+            racer_camera,
             selected_audio_device,
             available_audio_devices,
             available_output_devices,
@@ -1733,6 +1857,8 @@ impl AppState {
         dst.biolum_top_down = *biolum_top_down;
         dst.room_volume_smoke = *room_volume_smoke;
         dst.ferrofluid_pool_mode = *ferrofluid_pool_mode;
+        dst.flip_disc_mode = *flip_disc_mode;
+        dst.racer_camera = *racer_camera;
         clone_option_from(&mut dst.selected_audio_device, selected_audio_device);
         dst.available_audio_devices
             .clone_from(available_audio_devices);
@@ -1908,6 +2034,8 @@ impl AppState {
             biolum_top_down: self.biolum_top_down,
             room_volume_smoke: self.room_volume_smoke,
             ferrofluid_pool_mode: self.ferrofluid_pool_mode,
+            flip_disc_mode: self.flip_disc_mode,
+            racer_camera: self.racer_camera,
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
             available_output_devices: self.available_output_devices.clone(),
@@ -1935,6 +2063,67 @@ impl AppState {
             is_native_atmos: self.is_native_atmos,
             file_transfer: self.file_transfer.clone(),
             rt_control: std::sync::Arc::clone(&self.rt_control),
+        }
+    }
+
+    /// Cycles the active visualizer's alternate camera or pattern mode forward or backward,
+    /// updating the OSD notification and returning `true` when the active visualizer supports it.
+    pub fn cycle_visualizer_variant(&mut self, forward: bool) -> bool {
+        match self.visualizer_mode {
+            14 => {
+                self.racer_camera = if forward {
+                    self.racer_camera.next()
+                } else {
+                    self.racer_camera.prev()
+                };
+                self.osd_text = Some(format!("Camera: {}", self.racer_camera.label()));
+                self.osd_timer = 2.0;
+                true
+            }
+            20 => {
+                self.biolum_top_down = !self.biolum_top_down;
+                self.osd_text = Some(format!(
+                    "Camera: {}",
+                    if self.biolum_top_down {
+                        "Top-down"
+                    } else {
+                        "Perspective"
+                    }
+                ));
+                self.osd_timer = 2.0;
+                true
+            }
+            27 => {
+                self.ferrofluid_pool_mode = !self.ferrofluid_pool_mode;
+                self.osd_text = Some(if self.ferrofluid_pool_mode {
+                    "Ferrofluid: Studio Pool".to_string()
+                } else {
+                    "Ferrofluid: Magnetic Core".to_string()
+                });
+                self.osd_timer = 2.0;
+                true
+            }
+            31 => {
+                self.room_volume_smoke = !self.room_volume_smoke;
+                self.osd_text = Some(if self.room_volume_smoke {
+                    "💨 Smoke Volume: ON".to_string()
+                } else {
+                    "💨 Smoke Volume: OFF".to_string()
+                });
+                self.osd_timer = 2.0;
+                true
+            }
+            32 => {
+                self.flip_disc_mode = if forward {
+                    self.flip_disc_mode.next()
+                } else {
+                    self.flip_disc_mode.prev()
+                };
+                self.osd_text = Some(format!("Flip-Disc: {}", self.flip_disc_mode.label()));
+                self.osd_timer = 2.0;
+                true
+            }
+            _ => false,
         }
     }
 

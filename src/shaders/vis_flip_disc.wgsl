@@ -3,10 +3,10 @@
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
 @group(1) @binding(0) var<storage, read> discs: array<vec4<f32>>;
 
-const GRID_W: i32 = 96;
-const GRID_H: i32 = 64;
-const HALF_W: i32 = 48;
-const HALF_H: i32 = 32;
+const GRID_W: i32 = 128;
+const GRID_H: i32 = 96;
+const HALF_W: i32 = 64;
+const HALF_H: i32 = 48;
 const PI: f32 = 3.14159265;
 
 // Authentic 45-degree diagonal flip axis (+1, +1, 0) / sqrt(2)
@@ -437,7 +437,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = max(audio.aspect_ratio, 0.35);
 
     // Full-area camera framing: fills 100% of visualization area with zero borders at all aspects
-    let vis_h = clamp(22.0 / sqrt(aspect), 12.5, 30.0);
+    let vis_h = clamp(30.0 / sqrt(aspect), 17.5, 42.0);
     let tan_half_fov_y = clamp(0.31 / max(1.0, aspect * 0.57), 0.14, 0.35);
     let tan_half_fov_x = tan_half_fov_y * aspect;
     let cam_dist = (vis_h * 0.5) / tan_half_fov_y;

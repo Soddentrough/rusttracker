@@ -13,9 +13,9 @@ mod ui_overlay;
 pub use flip_disc::*;
 pub use meshes::{
     generate_biolum_ocean_mesh, generate_glass_lyrics_mesh, generate_lamp_mesh,
-    generate_neon_room_mesh,
+    generate_neon_room_mesh, generate_synthwave_racer_mesh,
 };
-pub(crate) use meshes::{generate_synthwave_racer_mesh, generate_vumeter_rack_mesh};
+pub(crate) use meshes::generate_vumeter_rack_mesh;
 pub(crate) use splash::{SplashCache, StatsDisplayCache};
 pub use types::*;
 
@@ -1186,7 +1186,7 @@ impl VulkanEngine {
         let synthwave_sky_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Synthwave Sky Pipeline"),
-                layout: Some(&render_pipeline_layout),
+                layout: Some(&render_pipeline_layout_3d),
                 vertex: wgpu::VertexState {
                     module: &synthwave_sky_shader,
                     entry_point: Some("vs_main"),
@@ -4073,6 +4073,7 @@ impl VulkanEngine {
                 !state.is_paused && !state.track_ended,
                 uniforms.smooth_time,
                 self.flip_disc_initialized,
+                state.flip_disc_mode,
             );
             self.flip_disc_pending_substeps = substeps;
             self.queue.write_buffer(
@@ -5084,8 +5085,19 @@ impl VulkanEngine {
             ) {
                 // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
                 let is_room_vis = state.visualizer_mode == 31;
+                let racer_cam = if state.visualizer_mode == 14 {
+                    Some(types::compute_synthwave_racer_camera(
+                        self.play_time as f32,
+                        aspect,
+                        state.racer_camera,
+                    ))
+                } else {
+                    None
+                };
                 let base_fov = if is_room_vis {
                     64.0_f32.to_radians()
+                } else if let Some((_, _, _, fov_deg)) = racer_cam {
+                    fov_deg.to_radians()
                 } else {
                     48.0_f32.to_radians()
                 };
@@ -5112,14 +5124,8 @@ impl VulkanEngine {
                     let (eye, target, up) =
                         compute_biolum_camera(self.play_time, state.biolum_top_down);
                     glam::Mat4::look_at_rh(eye, target, up)
-                } else if state.visualizer_mode == 14 {
-                    let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
-                    let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, cam_y, cam_z),
-                        glam::Vec3::new(0.0, 0.95, 14.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
+                } else if let Some((eye, target, up, _)) = racer_cam {
+                    glam::Mat4::look_at_rh(eye, target, up)
                 } else if state.visualizer_mode == 19 {
                     let vu_t = ((aspect - 0.85) / 0.40).clamp(0.0, 1.0);
                     let vu_smooth = vu_t * vu_t * (3.0 - 2.0 * vu_t);
@@ -5590,6 +5596,7 @@ impl VulkanEngine {
             } else if vis_def.id == 14 {
                 render_pass_3d.set_pipeline(&self.synthwave_sky_pipeline);
                 render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.camera_bind_group, &[]);
                 render_pass_3d.draw(0..3, 0..1);
             } else if vis_def.id == 19 {
                 render_pass_3d.set_pipeline(&self.vumeters_bg_pipeline);

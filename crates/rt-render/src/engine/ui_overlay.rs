@@ -1784,12 +1784,16 @@ impl VulkanEngine {
                             shortcut(ui, "p / n", Some("L1 / R1"), "Prev / Next Track");
                             shortcut(ui, "1-9", None, "Select Audio Track");
                             shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
-                            if state.visualizer_mode == 20 {
-                                shortcut(ui, "c", None, "Toggle Camera Mode");
+                            if state.visualizer_mode == 14 {
+                                shortcut(ui, "c", Some("R-Stick L/R"), "Cycle Camera Angle");
+                            } else if state.visualizer_mode == 20 {
+                                shortcut(ui, "c", Some("R-Stick L/R"), "Toggle Camera Mode");
                             } else if state.visualizer_mode == 27 {
-                                shortcut(ui, "c", None, "Toggle Ferrofluid View");
+                                shortcut(ui, "c", Some("R-Stick L/R"), "Toggle Ferrofluid View");
                             } else if state.visualizer_mode == 31 {
-                                shortcut(ui, "c", None, "Toggle Smoke Volume");
+                                shortcut(ui, "c", Some("R-Stick L/R"), "Toggle Smoke Volume");
+                            } else if state.visualizer_mode == 32 {
+                                shortcut(ui, "c", Some("R-Stick L/R"), "Cycle Flip-Disc Pattern");
                             }
                         });
                 });

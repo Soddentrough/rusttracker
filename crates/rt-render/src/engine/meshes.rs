@@ -2127,41 +2127,31 @@ fn load_obj_mesh(
     instantiate_obj_template(vertices, indices, &template, translation, scale, rot_y);
 }
 
-pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::with_capacity(32768);
-    let mut indices = Vec::with_capacity(49152);
+pub fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(36864);
+    let mut indices = Vec::with_capacity(55296);
 
-    // 1. Continuous Desert / Terrain Ground Planes (mat = 0.5)
-    let ground_w = 200.0;
+    // 1. Single Continuous Ocean / Water Plane (mat = 0.5)
+    // Placed slightly below y = 0.0 so curved highway asphalt never exposes side slits.
+    let ocean_w = 420.0;
     cyber_add_quad(
         &mut vertices,
         &mut indices,
-        [-ground_w, -0.05, -10.0],
-        [-9.0, -0.05, -10.0],
-        [-9.0, -0.05, 360.0],
-        [-ground_w, -0.05, 360.0],
-        [0.0, 1.0, 0.0],
-        0.5,
-        0.0,
-    );
-    cyber_add_quad(
-        &mut vertices,
-        &mut indices,
-        [9.0, -0.05, -10.0],
-        [ground_w, -0.05, -10.0],
-        [ground_w, -0.05, 360.0],
-        [9.0, -0.05, 360.0],
+        [-ocean_w, -0.06, -260.0],
+        [ocean_w, -0.06, -260.0],
+        [ocean_w, -0.06, 420.0],
+        [-ocean_w, -0.06, 420.0],
         [0.0, 1.0, 0.0],
         0.5,
         0.0,
     );
 
-    // 2. 3D Highway Roadbed, Curbs & Concrete K-Rails
+    // 2. 3D Highway Roadbed, Curbs & Concrete K-Rails (Extended Behind & Ahead for 360° Cameras)
     let road_half_w = 9.0;
     let seg_len = 3.5;
-    let num_segs = 100;
+    let num_segs = 160;
     for i in 0..num_segs {
-        let z0 = -8.0 + (i as f32) * seg_len;
+        let z0 = -180.0 + (i as f32) * seg_len;
         let z1 = z0 + seg_len;
 
         // Asphalt (mat = 0.0)
@@ -2220,36 +2210,167 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
         );
     }
 
-    // 3. Embedded 3D Low-Poly Supercar Model (.OBJ)
-    load_obj_mesh(
-        &mut vertices,
-        &mut indices,
+    // 3. Embedded 3D Low-Poly Supercar Model (.OBJ), grounded cleanly on y = 0.0
+    // Recompute crisp flat facet normals for non-wheel triangles to eliminate blotchy smoothed
+    // corner shading visible from close-up & front three-quarter camera angles.
+    let car_origin = [0.0_f32, 0.375, 5.2];
+    let car_template = parse_obj_template(
         include_str!("../../../../src/assets/models/supercar_f40.obj"),
-        [0.0, 0.40, 5.2],
-        [1.0, 1.0, 1.0],
-        0.0,
         3.0,
     );
+    for tri in &car_template.tris {
+        let is_wheel = (tri.mat - 7.0).abs() < 0.05 || (tri.mat - 7.5).abs() < 0.05;
+        let get_pos = |idx: usize| -> [f32; 3] {
+            if idx < car_template.positions.len() {
+                let p = car_template.positions[idx];
+                [
+                    p[0] + car_origin[0],
+                    p[1] + car_origin[1],
+                    p[2] + car_origin[2],
+                ]
+            } else {
+                car_origin
+            }
+        };
+        let p0 = get_pos(tri.verts[0].0);
+        let p1 = get_pos(tri.verts[1].0);
+        let p2 = get_pos(tri.verts[2].0);
 
-    // 3b. Solid Supercar Underbody Floor Pan & Interior Cabin Firewall (mat = 8.0 carbon)
+        let flat_norm = {
+            let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+            let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+            let cx = e1[1] * e2[2] - e1[2] * e2[1];
+            let cy = e1[2] * e2[0] - e1[0] * e2[2];
+            let cz = e1[0] * e2[1] - e1[1] * e2[0];
+            let len = (cx * cx + cy * cy + cz * cz).sqrt();
+            if len > 1e-6 {
+                [cx / len, cy / len, cz / len]
+            } else {
+                [0.0, 1.0, 0.0]
+            }
+        };
+
+        let start_idx = vertices.len() as u32;
+        for &(v_i, vn_i) in &tri.verts {
+            let pos = get_pos(v_i);
+            let norm = if is_wheel && vn_i < car_template.normals.len() {
+                car_template.normals[vn_i]
+            } else {
+                flat_norm
+            };
+            vertices.push(Vertex {
+                position: pos,
+                normal: norm,
+                tex_coords: [tri.mat, car_origin[2]],
+            });
+        }
+        indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2]);
+    }
+
+    // 3b. Structural Underbody Floor Pan, Inner Wheel-Well Liners, Tire Sidewalls, Intake & Headlights
+    // Underbody floor pan & central cabin tub (mat = 8.0)
     cyber_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, 0.35, 5.2],
-        [1.70, 0.04, 3.8],
+        [0.0, 0.315, 5.10],
+        [1.54, 0.05, 3.46],
         0.0,
         8.0,
     );
     cyber_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, 0.44, 4.8],
-        [1.30, 0.16, 1.8],
+        [0.0, 0.40, 5.05],
+        [1.36, 0.20, 1.90],
+        0.0,
+        8.0,
+    );
+    // Solid rocker/door inner hulls & low inner wheel-well liners (stay strictly beneath sloping fenders)
+    for &side_x in &[-0.82_f32, 0.82_f32] {
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [side_x, 0.36, 5.27],
+            [0.20, 0.22, 1.24],
+            0.0,
+            8.0,
+        );
+        // Front & rear dark carbon inner wheel-well tubs strictly inside fender height
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [side_x * 0.95, 0.31, 6.35],
+            [0.10, 0.24, 0.50],
+            0.0,
+            8.0,
+        );
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [side_x * 0.95, 0.33, 4.15],
+            [0.10, 0.28, 0.56],
+            0.0,
+            8.0,
+        );
+    }
+    // Rubber tire inner sidewall rings + solid inner wheel barrels (eliminating see-through gap)
+    let sidewall_segs = 24usize;
+    for &(z_ax, y_ax, r_in, r_out) in &[(6.35_f32, 0.315_f32, 0.20_f32, 0.30_f32), (4.15_f32, 0.335_f32, 0.22_f32, 0.335_f32)] {
+        for &x_face in &[-1.105_f32, -0.895_f32, 0.895_f32, 1.105_f32] {
+            let nx = if x_face < 0.0 && (x_face + 1.0).abs() > 0.05 { -1.0 } else if x_face > 0.0 && (x_face - 1.0).abs() > 0.05 { 1.0 } else if x_face < 0.0 { 1.0 } else { -1.0 };
+            for s in 0..sidewall_segs {
+                let a0 = (s as f32 / sidewall_segs as f32) * std::f32::consts::TAU;
+                let a1 = ((s + 1) as f32 / sidewall_segs as f32) * std::f32::consts::TAU;
+                let (s0, c0) = a0.sin_cos();
+                let (s1, c1) = a1.sin_cos();
+                let p_in0 = [x_face, y_ax + s0 * r_in, z_ax + c0 * r_in];
+                let p_out0 = [x_face, y_ax + s0 * r_out, z_ax + c0 * r_out];
+                let p_out1 = [x_face, y_ax + s1 * r_out, z_ax + c1 * r_out];
+                let p_in1 = [x_face, y_ax + s1 * r_in, z_ax + c1 * r_in];
+                cyber_add_quad(
+                    &mut vertices,
+                    &mut indices,
+                    p_in0,
+                    p_out0,
+                    p_out1,
+                    p_in1,
+                    [nx, 0.0, 0.0],
+                    7.0,
+                    5.2,
+                );
+            }
+        }
+    }
+    // Recessed front lower intake fascia & streamlined twin headlights tucked beneath front wedge (mat = 5.0)
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.23, 6.90],
+        [1.34, 0.10, 0.14],
+        0.0,
+        8.0,
+    );
+    for &hl_x in &[-0.56_f32, 0.56_f32] {
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [hl_x, 0.295, 6.96],
+            [0.28, 0.055, 0.12],
+            0.0,
+            5.0,
+        );
+    }
+    // Rear recessed engine bay mesh backing cleanly behind quad taillights
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.42, 3.44],
+        [1.52, 0.16, 0.10],
         0.0,
         8.0,
     );
 
-    // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
+    // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes, Extended Ring Behind & Ahead)
     let palm_template = parse_obj_template(
         include_str!("../../../../src/assets/models/palm_tree.obj"),
         10.0,
@@ -2258,8 +2379,8 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
         include_str!("../../../../src/assets/models/streetlamp.obj"),
         11.0,
     );
-    for i in 0..12 {
-        let pz = 18.0 + (i as f32) * 26.0;
+    for i in 0..18 {
+        let pz = -140.0 + (i as f32) * 26.0;
         // Left Palm Tree
         instantiate_obj_template(
             &mut vertices,
@@ -2280,14 +2401,16 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
         );
     }
 
-    // 5. Distant Horizon Skyscrapers (.OBJ Meshes)
+    // 5. Distant Horizon Skyscrapers (.OBJ Meshes, Forward Skyline + Rear Coastline Silhouettes)
     let skyscraper_template = parse_obj_template(
         include_str!("../../../../src/assets/models/skyscraper.obj"),
         12.0,
     );
     for i in 0..16 {
-        let ang = (i as f32) * 0.38 - 3.0;
-        let tx = ang * 46.0;
+        // Twin flanking downtown clusters leaving central sun corridor (|tx| >= 38.0) open
+        let side = if i < 8 { -1.0_f32 } else { 1.0_f32 };
+        let k = (i % 8) as f32;
+        let tx = side * (38.0 + k * 21.0);
         let tz = 260.0 + ((i * 7) % 5) as f32 * 14.0;
         let s = 0.75 + ((i * 3) % 4) as f32 * 0.15;
         instantiate_obj_template(
@@ -2297,6 +2420,21 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
             [tx, -2.0, tz],
             [s, s, s],
             (i as f32) * 0.5,
+        );
+    }
+    for i in 0..8 {
+        let side = if i < 4 { -1.0_f32 } else { 1.0_f32 };
+        let k = (i % 4) as f32;
+        let tx = side * (32.0 + k * 34.0);
+        let tz = -245.0 - ((i * 5) % 4) as f32 * 12.0;
+        let s = 0.72 + ((i * 3) % 4) as f32 * 0.14;
+        instantiate_obj_template(
+            &mut vertices,
+            &mut indices,
+            &skyscraper_template,
+            [tx, -2.0, tz],
+            [s, s, s],
+            (i as f32) * 0.7,
         );
     }
 
